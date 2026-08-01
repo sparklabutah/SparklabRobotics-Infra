@@ -1,0 +1,12 @@
+lerobot-record \
+    --robot.type=yam_ultra_bimanual \
+    --robot.left_channel=can_left --robot.right_channel=can_right \
+    --teleop.type=bi_quest_teleop \
+    --teleop.ws_url=wss://127.0.0.1:8443/ws \
+    --dataset.repo_id=minhphd/test \
+    --dataset.single_task="put stuff in a box" \
+    --dataset.num_episodes=1 --dataset.fps=30 \
+    --dataset.episode_time_s=30 --dataset.reset_time_s=10 \
+    --dataset.streaming_encoding=true \
+    --dataset.encoder_threads=2 \
+    --dataset.push_to_hub=false

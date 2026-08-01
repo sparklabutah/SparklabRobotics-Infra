@@ -1,0 +1,58 @@
+# ── Never commit: model checkpoints & datasets ────────────────────────────
+# MolmoAct2/ in the previous repo was 112 GB. Keep weights out of git —
+# use the HF Hub (--policy.push_to_hub) or a shared filesystem.
+MolmoAct2/
+checkpoints/
+outputs/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+datasets/
+*.parquet
+
+# ── Never commit: secrets & key material ──────────────────────────────────
+.env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
+*.crt
+*.p12
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Notebooks & scratch ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.bak
+*.orig
+*.rej
+
+# ── Logs & run artefacts ──────────────────────────────────────────────────
+*.log
+MUJOCO_LOG.TXT
+wandb/
+.claude/
+
+# ── OS / editor ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Meshes ARE tracked on purpose (robots/*/model/assets/*.stl, ~7 MB each):
+# the MJCF is useless without them and they change rarely. If they start
+# churning, move them to git-lfs rather than ignoring them.

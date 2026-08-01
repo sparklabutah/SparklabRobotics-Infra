@@ -1,0 +1,122 @@
+total_cameras: 3
+cameras:
+  camera_0_323622272781:
+    model: RealSense D405
+    serial_number: '323622272781'
+    streams:
+      depth:
+        resolution:
+          width: 848
+          height: 480
+        focal_length:
+          fx: 428.07342529296875
+          fy: 428.07342529296875
+        principal_point:
+          ppx: 426.7185363769531
+          ppy: 241.56121826171875
+        distortion:
+          model: brown_conrady
+          coefficients:
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+      color:
+        resolution:
+          width: 848
+          height: 480
+        focal_length:
+          fx: 433.84075927734375
+          fy: 433.1690673828125
+        principal_point:
+          ppx: 426.48785400390625
+          ppy: 242.84481811523438
+        distortion:
+          model: inverse_brown_conrady
+          coefficients:
+          - -0.051134999841451645
+          - 0.06333200633525848
+          - -0.0003519742167554796
+          - 0.00045342533849179745
+          - -0.021956197917461395
+  camera_1_243322071190:
+    model: RealSense D435F
+    serial_number: '243322071190'
+    streams:
+      depth:
+        resolution:
+          width: 848
+          height: 480
+        focal_length:
+          fx: 428.3955383300781
+          fy: 428.3955383300781
+        principal_point:
+          ppx: 431.89044189453125
+          ppy: 233.24130249023438
+        distortion:
+          model: brown_conrady
+          coefficients:
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+      color:
+        resolution:
+          width: 640
+          height: 480
+        focal_length:
+          fx: 607.4273071289062
+          fy: 607.263427734375
+        principal_point:
+          ppx: 323.3648376464844
+          ppy: 242.44586181640625
+        distortion:
+          model: inverse_brown_conrady
+          coefficients:
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+  camera_2_353322271147:
+    model: RealSense D405
+    serial_number: '353322271147'
+    streams:
+      depth:
+        resolution:
+          width: 848
+          height: 480
+        focal_length:
+          fx: 429.5285949707031
+          fy: 429.5285949707031
+        principal_point:
+          ppx: 421.9674987792969
+          ppy: 239.62767028808594
+        distortion:
+          model: brown_conrady
+          coefficients:
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+          - 0.0
+      color:
+        resolution:
+          width: 848
+          height: 480
+        focal_length:
+          fx: 434.97406005859375
+          fy: 434.4390563964844
+        principal_point:
+          ppx: 416.7867431640625
+          ppy: 241.59170532226562
+        distortion:
+          model: inverse_brown_conrady
+          coefficients:
+          - -0.05117759853601456
+          - 0.06367470324039459
+          - -0.0008586639887653291
+          - -0.0004838009481318295
+          - -0.022017283365130424
