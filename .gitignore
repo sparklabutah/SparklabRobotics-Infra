@@ -1,18 +1,16 @@
-# ── Never commit: model checkpoints & datasets ────────────────────────────
-# MolmoAct2/ in the previous repo was 112 GB. Keep weights out of git —
-# use the HF Hub (--policy.push_to_hub) or a shared filesystem.
+# Checkpoints & datasets — push weights to the HF Hub, not here.
 MolmoAct2/
 checkpoints/
 outputs/
+datasets/
 *.safetensors
 *.ckpt
 *.pt
 *.pth
 *.bin
-datasets/
 *.parquet
 
-# ── Never commit: secrets & key material ──────────────────────────────────
+# Secrets & key material. The .bak-<ts> pattern is what make_certs.sh writes.
 .env
 .env.*
 !.env.example
@@ -21,8 +19,9 @@ certs/
 *.key
 *.crt
 *.p12
+*.bak-*
 
-# ── Python ────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -34,25 +33,31 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
-# ── Notebooks & scratch ───────────────────────────────────────────────────
+# Scratch
 .ipynb_checkpoints/
 *.bak
 *.orig
 *.rej
 
-# ── Logs & run artefacts ──────────────────────────────────────────────────
+# Logs & run artefacts
+logs/
 *.log
 MUJOCO_LOG.TXT
 wandb/
-.claude/
 
-# ── OS / editor ───────────────────────────────────────────────────────────
+# Claude Code: share project settings, keep personal overrides local.
+.claude/*
+!.claude/settings.json
+
+# OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 *.swp
 
-# Meshes ARE tracked on purpose (robots/*/model/assets/*.stl, ~7 MB each):
-# the MJCF is useless without them and they change rarely. If they start
-# churning, move them to git-lfs rather than ignoring them.
+# Meshes ARE tracked (robots/*/model/assets/*.stl): the MJCF is useless
+# without them. Move to git-lfs if they start churning.
+
+# Build artifact from sparklab_sim.convert, derived from the vendored URDF.
+src/lerobot_robot_sparklab/robots/yam_ultra/model/usd/
