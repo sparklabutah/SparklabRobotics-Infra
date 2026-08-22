@@ -1,49 +1,20 @@
 """``lerobot-rollout`` with a live control channel.
 
-Same CLI as ``lerobot-rollout`` -- every flag is forwarded to LeRobot's own
-parser untouched -- plus a small HTTP control port. While the loop runs you
-can retarget the policy, halt it, and send the arms home, without restarting
-the process. Restarting costs ~90 s of model load, which is the whole reason
-this exists.
+Same CLI as ``lerobot-rollout``, every flag forwarded untouched, plus an HTTP
+control port. While the loop runs you can retarget the policy, halt it and send
+the arms home without paying the ~90 s model load again::
 
     python -m lerobot_robot_sparklab.rollout.live --control-port 8090 \\
         --strategy.type=base --policy.path=... --robot.type=yam_ultra_sim \\
         --task="put the marker into the cardboard box" --fps 20
 
-Drive it from another terminal with the REPL client:
+    python -m lerobot_robot_sparklab.rollout.ctl        # REPL client
+    curl -s localhost:8090/cmd -d '{"cmd":"reset"}'     # or by hand
 
-    python -m lerobot_robot_sparklab.rollout.ctl
-
-or by hand:
-
-    curl -s localhost:8090/status
-    curl -s localhost:8090/cmd -d '{"cmd":"task","arg":"pick up the scissors"}'
-    curl -s localhost:8090/cmd -d '{"cmd":"reset"}'
-
-TWO THINGS THAT ARE NOT OBVIOUS
-
-*Changing the task must also reset the engine.* The policy emits a 30-step
-chunk and the loop drains it one action at a time. Swapping ``engine._task``
-alone leaves up to 30 already-queued actions -- 1.5 s at 20 Hz, longer with
-interpolation -- still executing under the OLD prompt, so the arm appears to
-ignore the new command and then lurch. ``retarget()`` clears the queue.
-
-*Reset ramps, it does not teleport.* Home is reached by commanding an eased
-trajectory over ``home_duration_s`` (5 s), one waypoint per tick through
-``send_action``, so it still passes the follower's ``max_relative_target``
-clamp like any policy action -- the clamp is a backstop, not the thing setting
-the speed. A direct pose write would be fine in sim and violent on hardware;
-this file is meant to drive both.
-
-*Reset parks and HOLDS.* Homing while the loop keeps stepping means the next
-tick drives the policy on the unchanged task and the arm climbs straight back
-out. ``reset``/``park``/``home`` set ``held``; a new task clears it.
-
-THREADING: HTTP handlers never touch the robot or the policy. They append to a
-queue that the control loop drains between ticks -- the same discipline
-``policy_server`` uses, and for the same reason: neither the robot transport
-nor the inference engine is thread-safe, and a blocking call made from an HTTP
-thread will deadlock the loop rather than fail.
+HTTP handlers never touch the robot or the policy: they queue commands that the
+control loop drains between ticks, since neither the robot transport nor the
+inference engine is thread-safe. See DESIGN.md for the retarget, ramp and hold
+semantics.
 """
 
 from __future__ import annotations
@@ -66,36 +37,25 @@ DEFAULT_CONTROL_PORT = 8090
 DEFAULT_HOME = 0.0
 
 
-# ---------------------------------------------------------------------------
-# control state
-# ---------------------------------------------------------------------------
+# ---- control state --------------------------------------------------------
 @dataclass
 class Control:
     """Shared state between the HTTP threads and the control loop.
 
-    Commands are queued rather than applied in place so that every mutation
-    happens at a known point in the tick, between reading an observation and
-    sending an action. Applying a task change halfway through
-    ``send_next_action`` would mix two prompts inside one chunk.
+    Commands are queued rather than applied in place, so every mutation happens
+    between reading an observation and sending an action — applying a task
+    change mid-``send_next_action`` would mix two prompts inside one chunk.
     """
 
     task: str = ""
     paused: bool = False
-    # Parked and waiting for an instruction. Set by reset/park/home, cleared by
-    # a new task (or an explicit resume).
-    #
-    # Distinct from `paused` because the reason differs and the operator needs
-    # to see which: `paused` is "stopped mid-task, the task still stands",
-    # `held` is "at home, there is nothing to do until you say so". Without it,
-    # homing the arm and then leaving the loop running means the very next tick
-    # steps the policy on the SAME task and the arm climbs straight back out of
-    # the pose you just put it in.
+    # Parked and waiting. Distinct from `paused` ("stopped mid-task, the task
+    # still stands"): without it the next tick climbs back out of home.
     held: bool = False
     home_pos: float = DEFAULT_HOME
     reset_tolerance: float = 0.05      # rad, per joint
-    # How long the ramp to home takes. Set to 0 to fall back to sending the
-    # final target and letting the follower's Δq clamp rate-limit it — faster,
-    # and abrupt enough to read as a jolt, which is why it is not the default.
+    # 0 falls back to sending the final target and letting the follower's Δq
+    # clamp rate-limit it — faster, but abrupt enough to read as a jolt.
     home_duration_s: float = 5.0
     # Budget for the arm to *settle* onto the target after the ramp, not for
     # the ramp itself.
@@ -104,13 +64,8 @@ class Control:
     _pending: queue.Queue = field(default_factory=queue.Queue)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    # Latest observation, for anything WATCHING rather than driving -- the web
-    # harness, and any high-level agent reasoning over the scene.
-    #
-    # Latest-only, never a queue: a watcher that falls behind must skip frames
-    # rather than build a backlog and hand an agent a scene that no longer
-    # exists. Encoded in the loop thread rather than per request, so N watchers
-    # cannot multiply encode cost onto the control loop.
+    # For watchers, not drivers. Latest-only so a slow one skips frames, and
+    # encoded once in the loop thread so N watchers cannot multiply the cost.
     _frames: dict = field(default_factory=dict)      # name -> JPEG bytes
     _state: dict = field(default_factory=dict)       # joint -> radians
     _frame_t: float = 0.0
@@ -165,10 +120,11 @@ class Control:
     def publish(self, obs: dict, every: int = 1) -> None:
         """Snapshot the tick's observation for watchers. Called from the loop.
 
-        ``every`` subsamples: an agent reasoning at ~1 Hz does not need a JPEG
-        encode at every 30 Hz tick, and the encode is on the control loop's
-        critical path. Failures are swallowed -- a watcher missing a frame must
-        never be able to interrupt the robot.
+        Failures are swallowed: a watcher missing a frame must never interrupt
+        the robot.
+
+        every: subsample factor, since the JPEG encode sits on the loop's
+            critical path and an agent reasoning at ~1 Hz needs far fewer.
         """
         self._frame_seq += 1
         if every > 1 and self._frame_seq % every:
@@ -212,9 +168,7 @@ class Control:
 _COMMANDS = {"task", "reset", "park", "pause", "resume", "home", "status", "quit"}
 
 
-# ---------------------------------------------------------------------------
-# control server
-# ---------------------------------------------------------------------------
+# ---- control server -------------------------------------------------------
 def _serve(control: Control, host: str, port: int) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -279,15 +233,12 @@ def _serve(control: Control, host: str, port: int) -> ThreadingHTTPServer:
     return srv
 
 
-# ---------------------------------------------------------------------------
-# strategy
-# ---------------------------------------------------------------------------
+# ---- strategy -------------------------------------------------------------
 def build_strategy_class():
     """Import LeRobot lazily and return the interactive strategy class.
 
-    Deferred because importing ``lerobot.rollout`` pulls in torch and the
-    plugin registry, which must not happen at module import time -- argv is
-    rewritten first (see ``main``).
+    Deferred because importing ``lerobot.rollout`` pulls in torch and the plugin
+    registry, which must not happen before ``main`` rewrites argv.
     """
     from lerobot.rollout.strategies.base import BaseStrategy
     from lerobot.rollout.strategies.core import send_next_action
@@ -296,16 +247,13 @@ def build_strategy_class():
     class InteractiveStrategy(BaseStrategy):
         """``BaseStrategy`` whose loop checks a control queue every tick.
 
-        The loop is reimplemented rather than wrapped because the engine's
-        ``pause``/``resume`` are no-op hooks on the ABC -- ``SyncInferenceEngine``
-        does not override them, so pausing has to happen in the caller. Everything
-        else (observation processing, warm-up handling, action dispatch,
-        telemetry) is reused from the parent unchanged.
+        Reimplemented rather than wrapped because ``pause``/``resume`` are no-op
+        hooks on the ABC, so pausing has to happen in the caller. Everything
+        else is reused from the parent unchanged.
         """
 
-        # Subsample frame publishing: encoding sits on the control loop's
-        # critical path, and an agent reasoning at ~1 Hz does not need one per
-        # 30 Hz tick. Overridden from --publish-every.
+        # Encoding sits on the loop's critical path and an agent reasoning at
+        # ~1 Hz needs far fewer. Overridden from --publish-every.
         publish_every = 1
 
         def __init__(self, config, control: Control):
@@ -316,9 +264,7 @@ def build_strategy_class():
         def retarget(self, task: str) -> None:
             """Point the policy at a new instruction, starting from a clean chunk.
 
-            Also releases a hold: submitting a task is the operator saying go,
-            and it is the only thing that lifts the park that reset/park/home
-            leave behind.
+            Also releases a hold — submitting a task is the operator saying go.
             """
             engine = self._engine
             engine._task = task
@@ -347,18 +293,12 @@ def build_strategy_class():
         def go_home(self, ctx) -> bool:
             """Interpolate to the home pose over ``home_duration_s``.
 
-            NOT "send the final target and let the Δq clamp rate-limit it".
-            That ramps at whatever the cap allows — 0.15 rad/tick at 30 Hz is
-            ~4.5 rad/s — so the arm snapped home at the fastest speed the
-            safety bound permitted, which reads as a jolt. Commanding the
-            trajectory makes the speed a property of *this move* instead of a
-            side effect of a limit; the clamp is still underneath, now as a
-            backstop rather than the mechanism.
+            Commands the trajectory rather than letting the Δq clamp rate-limit
+            a single target, so speed is a property of this move and not a side
+            effect of a safety bound. Eased with smoothstep, so velocity starts
+            and ends at zero.
 
-            Eased with smoothstep, so velocity starts and ends at zero. Peak is
-            1.5x the average and still an order of magnitude under the clamp.
-
-            Returns True if home was reached within tolerance.
+            Returns: True if home was reached within tolerance.
             """
             robot = ctx.hardware.robot_wrapper
             cfg = ctx.runtime.cfg
@@ -375,9 +315,8 @@ def build_strategy_class():
                 logger.info("already home")
                 return True
 
-            # Interpolate from where the arm actually is. A joint the
-            # observation does not report is pinned to its target, i.e. left
-            # alone by this ramp rather than swept from a guessed start.
+            # From where the arm actually is. An unreported joint is pinned to
+            # its target rather than swept from a guessed start.
             start = {k: (float(obs[k]) if k in obs else target[k]) for k in target}
 
             t_start = time.perf_counter()
@@ -392,15 +331,8 @@ def build_strategy_class():
                 if (rest := dt - (time.perf_counter() - tick)) > 0:
                     precise_sleep(rest)
 
-            # Settle. The arm lags the commanded waypoint, so hold the final
-            # target until it actually arrives. With duration=0 this is the
-            # whole move, i.e. the old clamp-limited behaviour.
-            #
-            # Always sends the exact target at least once: the ramp loop exits
-            # with `a` a hair under 1.0, so its last waypoint is fractionally
-            # short of home. Close enough to pass the tolerance check, which
-            # would then skip the settle entirely and leave the arm parked at
-            # not-quite-home for good.
+            # The arm lags the waypoint, so hold the target until it arrives.
+            # Sent at least once: the ramp exits a hair short of the target.
             deadline = time.perf_counter() + self.control.reset_timeout_s
             while True:
                 if ctx.runtime.shutdown_event.is_set():
@@ -424,10 +356,8 @@ def build_strategy_class():
         def reset_scene(self, ctx) -> None:
             """Ask the sim to put the props back, if the robot is a sim robot.
 
-            Best-effort by design: on hardware there is nothing to reset (a
-            real marker does not teleport home), and an older policy_server
-            has no /reset route. Neither is an error worth aborting a reset
-            for, so both are logged and stepped over.
+            Best-effort: hardware has nothing to reset and an older
+            policy_server has no /reset route. Neither aborts the reset.
             """
             robot = getattr(ctx.hardware.robot_wrapper, "inner", None)
             request = getattr(robot, "_request", None)
@@ -479,10 +409,8 @@ def build_strategy_class():
                         except Exception as e:
                             logger.warning("park failed (%s: %s)",
                                            type(e).__name__, e)
-                    # All three of park/reset/home put the arm somewhere safe on
-                    # purpose, so all three hold it there. Stepping the policy
-                    # again on the unchanged task would undo the move within one
-                    # tick, which is what made these look like they did nothing.
+                    # park/reset/home all put the arm somewhere safe, so all
+                    # three hold it there — otherwise the next tick undoes it.
                     self.hold("parked")
                 elif cmd == "reset":
                     self.do_reset(ctx)          # sets the hold itself
@@ -504,9 +432,8 @@ def build_strategy_class():
                     self._cached_obs_processed = None
                     with self.control._lock:
                         self.control.paused = False
-                        # Explicit operator "go", so it also lifts a hold — the
-                        # escape hatch for continuing the current task after a
-                        # reset without retyping it.
+                        # Explicit operator "go", so it lifts a hold too: continue
+                        # the current task after a reset without retyping it.
                         self.control.held = False
                     logger.info("RESUMED")
                     self.control.note("resumed")
@@ -542,10 +469,8 @@ def build_strategy_class():
                     logger.info("Duration limit reached (%.0fs)", cfg.duration)
                     break
 
-                # Keep pulling observations while stopped: the camera feed stays
-                # live in the visualiser, which is the point -- you are looking
-                # at the scene while you reposition something, or deciding what
-                # to send next while the arm holds at home.
+                # Keep pulling observations while stopped, so the feed stays live
+                # while you reposition something or decide what to send next.
                 obs = robot.get_observation()
                 # Publish before the check: a stopped loop is exactly when a
                 # watcher most needs to see the scene.
@@ -576,16 +501,12 @@ def build_strategy_class():
     return InteractiveStrategy
 
 
-# ---------------------------------------------------------------------------
-# entry point
-# ---------------------------------------------------------------------------
+# ---- entry point ----------------------------------------------------------
 def _extract_own_flags(argv: list[str]) -> tuple[dict, list[str]]:
     """Pull this module's own flags out of argv before draccus sees it.
 
-    LeRobot parses with draccus, which errors on anything it does not
-    recognise. Rather than fork its config dataclass, the extra flags are
-    removed here and everything else is passed through verbatim -- so any
-    ``lerobot-rollout`` command line works unchanged with the binary swapped.
+    draccus errors on anything it does not recognise, so rather than fork its
+    config dataclass the extra flags are removed and the rest passed verbatim.
     """
     own = {"--control-port": ("control_port", int),
            "--control-host": ("control_host", str),
@@ -663,13 +584,8 @@ def main() -> int:
                 shutdown_visualization(cfg.display_mode)
         logger.info("Rollout finished")
 
-    # parser.wrap() discovers the config class with
-    # ``inspect.getfullargspec(fn).annotations[...]``, i.e. the RAW annotation.
-    # This module has ``from __future__ import annotations``, so a written-out
-    # ``cfg: RolloutConfig`` would arrive as the *string* "RolloutConfig" and
-    # draccus would reject it with "must be called with a dataclass type".
-    # Bind the real class instead of dropping the future-import for the whole
-    # file.
+    # parser.wrap() reads the RAW annotation, which PEP 563 makes a string
+    # here, so bind the real class rather than writing out `cfg: RolloutConfig`.
     _run.__annotations__["cfg"] = RolloutConfig
     parser.wrap()(_run)()
     return 0

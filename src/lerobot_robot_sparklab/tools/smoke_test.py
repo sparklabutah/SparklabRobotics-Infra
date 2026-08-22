@@ -1,19 +1,13 @@
 """BiQuestTeleoperator smoke test — fake Quest, no hardware.
 
-Spins up a fake Quest as a WS client that sends synthetic xr_frame
-messages through the relay server, while the BiQuestTeleoperator
-subscribes from the other side. Verifies:
+A fake Quest sends synthetic xr_frame messages through the relay while the
+teleoperator subscribes from the other side. Checks the connect handshake, the
+action schema, that a right-hand clutch engage plus +X motion drives
+right_joint_*, that the trigger drives right_gripper.pos, and that the left arm
+stays at home.
 
-  - teleop.connect() blocks until the WS is open
-  - get_action() returns the correct dict schema with home pose first
-  - clutch ENGAGE on right grip captures origin, moving controller +X
-    drives the right_joint_* values
-  - trigger pull drives right_gripper.pos
-  - left arm stays at home (untouched in this test)
+Needs a local relay (sparklab-relay) and lerobot::
 
-Prereqs: relay running locally (sparklab-relay), lerobot installed.
-
-Run:
     python -m lerobot_robot_sparklab.tools.smoke_test
 """
 
@@ -107,12 +101,8 @@ def main() -> None:
     print(f"[before xr_frame] right arm: {fmt_action(a0, 'right')}  gripper={a0['right_gripper.pos']:.3f}")
     print(f"[before xr_frame] left  arm: {fmt_action(a0, 'left')}  gripper={a0['left_gripper.pos']:.3f}")
 
-    # Scenario:
-    #  1. controller idle, no clutch -> action stays at home
-    #  2. clutch engage at (0, 1.4, -0.3)
-    #  3. controller moves +X by 5 cm in two steps (still engaged)
-    #  4. trigger 0.5 then 1.0 (gripper closes proportionally)
-    #  5. release clutch
+    # Idle, engage at (0, 1.4, -0.3), move +X 5 cm in two steps, trigger to
+    # 0.5 then 1.0, release.
     scenario = [
         (0.30, _frame(right_pos=[0.0, 1.4, -0.3], right_grip=False, right_trigger=0.0)),
         (0.30, _frame(right_pos=[0.0, 1.4, -0.3], right_grip=True,  right_trigger=0.0)),  # engage

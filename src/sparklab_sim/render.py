@@ -1,8 +1,7 @@
 """Render the scene's cameras to numpy arrays.
 
-Holds the Replicator render product and annotator so they are created **once**
-per camera. Creating them per frame is slow enough to make interactive scene
-tuning miserable, which is the whole thing this module exists to avoid.
+Holds the Replicator render product and annotator so they are created once per
+camera rather than per frame, which is slow enough to make tuning miserable.
 """
 
 from __future__ import annotations
@@ -11,13 +10,12 @@ import numpy as np
 
 
 class Renderer:
-    """One render product bound to one camera prim.
+    """One render product bound to one camera prim::
 
         r = Renderer(app, scene.CAMERA_PRIM)
         frame = r.frame()          # (H, W, 3) uint8 RGB
 
-    Reuse it across tweaks: change the camera or the arm pose, call
-    ``frame()`` again. Do not build a new one per iteration.
+    Reuse it across tweaks rather than building one per iteration.
     """
 
     def __init__(self, app, camera_prim: str, resolution=(640, 360),
@@ -40,9 +38,8 @@ class Renderer:
     def frame(self, settle: int | None = None) -> np.ndarray:
         """Current camera image as (H, W, 3) uint8 RGB.
 
-        ``settle`` controls how many app updates run before reading. Lower it
-        (2-3) for fast interactive tweaking where a slightly noisy image is
-        fine; raise it for a final capture.
+        settle: app updates to run before reading. 2-3 is fine for interactive
+            tweaking; raise it for a final capture.
         """
         self._pump(self._settle if settle is None else settle)
         return np.asarray(self._rgb.get_data())[..., :3].astype(np.uint8)
@@ -50,27 +47,15 @@ class Renderer:
     def close(self) -> None:
         """Release the render product. **Call this before reopening a stage.**
 
-        Not optional and not merely a leak. A render product is a prim under
-        ``/Render/OmniverseKit/HydraTextures/``; reopening or reloading the
-        stage deletes those prims while Hydra still holds pointers to them,
-        and the next update dereferences freed memory:
+        A render product is a prim under ``/Render/OmniverseKit/HydraTextures/``;
+        reloading the stage deletes it while Hydra still holds a pointer, and
+        the next update segfaults on freed memory.
 
-            [Error] [rtx.hydra] Invalid USD RenderProduct Prim: .../Replicator_01
-            [Error] [omni.hydra] Unable to find RP Prim from previous update pass!
-            Segmentation fault
-
-        That crash is why this method exists. It used to be absent, and the
-        live viewer's teardown probed for ``close``/``destroy``/``detach`` on
-        *this* object, found none of them (``destroy`` is on the underlying
-        HydraTexture, not here), and silently did nothing — so every reload
-        took the process down and cost a full Isaac boot to recover.
-
-        Idempotent: safe to call twice, and safe on a partially built object.
+        Idempotent: safe to call twice, and on a partially built object.
         """
         rgb, product = getattr(self, "_rgb", None), getattr(self, "_product", None)
-        # Detach before destroy: the annotator holds its own reference to the
-        # product, and destroying underneath it leaves the registry with a
-        # dangling entry that resurfaces on the next attach.
+        # Detach first: the annotator holds its own reference, and destroying
+        # underneath it leaves a dangling registry entry.
         if rgb is not None and product is not None:
             try:
                 rgb.detach([product])
@@ -87,9 +72,8 @@ class Renderer:
 def side_by_side(*images: np.ndarray, gap: int = 8) -> np.ndarray:
     """Lay images out horizontally with a separator, for real-vs-render diffs.
 
-    Images must share a height. Mismatched heights are a bug worth surfacing
-    loudly rather than silently letterboxing — a rendered frame that is not
-    the same shape as the recorded one means the camera resolution is wrong.
+    Images must share a height: a mismatch means the camera resolution is
+    wrong, which is worth raising rather than letterboxing away.
     """
     if not images:
         raise ValueError("nothing to lay out")
@@ -113,11 +97,8 @@ def grid(images: dict[str, np.ndarray], cols: int = 2,
          label: bool = True) -> np.ndarray:
     """Tile ``{name: image}`` into one labelled image.
 
-    Used to put every camera plus the workspace overview into a single MJPEG
-    stream, so one browser tab shows the whole scene rather than needing a tab
-    per camera. Cells are padded to a common size instead of resized — a
-    camera whose resolution has drifted from the dataset's should look wrong,
-    not be silently scaled to fit.
+    Puts every camera into a single MJPEG stream. Cells are padded rather than
+    resized, so a camera whose resolution has drifted looks wrong.
     """
     import cv2
 
@@ -150,11 +131,7 @@ def grid(images: dict[str, np.ndarray], cols: int = 2,
 
 
 def abs_diff(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, float]:
-    """Absolute difference image and mean absolute error (0-255).
-
-    The scalar is what turns "looks about right" into something you can watch
-    go down while tuning.
-    """
+    """Absolute difference image and mean absolute error (0-255)."""
     if a.shape != b.shape:
         raise ValueError(f"shape mismatch {a.shape} vs {b.shape}")
     d = np.abs(a.astype(np.int16) - b.astype(np.int16))

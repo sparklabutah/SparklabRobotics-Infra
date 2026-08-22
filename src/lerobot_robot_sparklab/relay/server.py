@@ -1,35 +1,22 @@
 """FastAPI relay + WebRTC publisher for VR teleop.
 
-Two responsibilities, both per WebSocket client:
+Per WebSocket client, it does two things: broadcasts pose/state messages
+(RELAY_TYPES below) between the Quest browser and the teleop process, and
+publishes camera tracks over WebRTC. On webrtc_request it opens whichever
+configured cameras exist, builds an RTCPeerConnection with one track each, and
+exchanges SDP/ICE over the same socket. `camera_toggle` mutes a track by
+repeating its last frame, which costs near-zero bandwidth under H.264 and
+needs no renegotiation.
 
-  1. Broadcast relay for pose/state messages (xr_frame, ik_state,
-     config_update, … — the full set is RELAY_TYPES below) between the
-     Quest browser and the pose-streaming client
-     (e.g. `robots/yam_ultra/teleop_bimanual.py`).
-
-  2. WebRTC publisher for camera tracks. Camera specs come from either
-     CAM_TOP / CAM_LEFT / CAM_RIGHT env vars (v4l2 devices — a legacy
-     fixed 3-slot setup) or, if VR_TELEOP_CAMERAS_YAML is set, a YAML file
-     listing arbitrary cameras by id, each v4l2 (device path) or
-     RealSense (serial) — see robots/yam_ultra/config/cameras.yaml for the
-     format. On webrtc_request the server opens any cameras that exist,
-     creates an RTCPeerConnection with one VideoStreamTrack per camera,
-     and exchanges SDP/ICE over the same WebSocket. Per-camera enable
-     toggles (camera_toggle messages) mute the track by repeating the
-     last frame — H.264 inter-frame compression drops the bandwidth to
-     near zero without renegotiating SDP.
-
-Topology:
     Quest browser  ── xr_frame ─────►  server  ── xr_frame ──►  teleop process
-                                                                       │
-                   ◄── ik_state ──   server  ◄── ik_state ──   (teleop publishes)
-                   ◄═ WebRTC video ═ server                    (cv2 → aiortc tracks)
+                   ◄── ik_state ──     server  ◄── ik_state ──
+                   ◄═ WebRTC video ═   server
 
-Run (console script from `pip install -e ".[relay]"`):
-    sparklab-relay                            # bind 127.0.0.1 (USB / tunnel)
+Run::
+
+    sparklab-relay                          # 127.0.0.1, for USB / tunnel
     sparklab-relay --host 0.0.0.0 \
-        --ssl-keyfile  certs/key.pem \
-        --ssl-certfile certs/cert.pem       # LAN HTTPS for direct Quest access
+        --ssl-keyfile certs/key.pem --ssl-certfile certs/cert.pem   # LAN HTTPS
 """
 
 import argparse
@@ -69,31 +56,22 @@ RELAY_TYPES = {
 
 
 # ── Camera capture ───────────────────────────────────────────────────────
-# One CameraReader per v4l2 device. The reader runs a blocking cv2 loop in
-# a background thread; the latest frame is published via a lock-protected
-# slot. CameraTrack.recv() (called by aiortc at the negotiated fps) reads
-# from the slot. A single reader can fan out to multiple peer connections.
+# One reader per device: a blocking cv2 loop feeding a lock-protected slot.
 
 @dataclass(frozen=True)
 class CameraSpec:
-    """Camera identity + capture parameters. `id` matches the WS schema
-    (top | left_wrist | right_wrist by convention — see the README's
-    "Adapting to a different arm"); `label` is the human-facing name;
-    `rotate` is 0/90/180/270 degrees applied in the capture thread so
-    every consumer sees the corrected frame (no client-side fix-up).
+    """Camera identity + capture parameters.
 
-    `backend` selects the reader: "v4l2" (`device` is a /dev/videoN path,
-    read via cv2) or "realsense" (`device` is unused; `serial` selects the
-    camera and `exposure`/`white_balance`/`gain`, if set, freeze the
-    sensor — RealSense autoexposure hunts/flickers at a fixed frame rate
-    otherwise).
-
-    `crop_height`, if set and smaller than `height`, center-crops that many
-    rows off the top and bottom of every captured frame — for matching a
-    target video shape (e.g. a reference dataset's) when the sensor can't
-    natively capture it (the D405 wrist cameras have no 360-tall mode at
-    all, only 480). Applied after `rotate`, so it always crops the frame's
-    final on-screen height regardless of camera mounting orientation."""
+    id: matches the WS schema, by convention top | left_wrist | right_wrist.
+    label: human-facing name.
+    rotate: 0/90/180/270, applied in the capture thread so every consumer sees
+        the corrected frame.
+    backend: "v4l2" (`device` is a /dev/videoN path) or "realsense" (`serial`
+        selects the camera; exposure/white_balance/gain freeze the sensor).
+    crop_height: if smaller than `height`, centre-crops that many rows to match
+        a target video shape the sensor cannot capture natively. Applied after
+        `rotate`, so it always crops the final on-screen height.
+    """
     id: str
     label: str
     device: str | None
@@ -175,14 +153,12 @@ class CameraReader:
 
 
 class RealSenseCameraReader:
-    """Background pyrealsense2 grabber, opened by serial. Same thread-safe
-    latest-frame slot interface as CameraReader. Freezes exposure/white
-    balance/gain from the spec if given (RealSense autoexposure hunts and
-    flickers when read at a fixed frame rate otherwise) — see
-    cameras/calibrate_camera.py for how those values are derived.
+    """Background pyrealsense2 grabber, opened by serial.
 
-    pyrealsense2 is only imported here, lazily, so v4l2-only setups (no
-    RealSense hardware or SDK) never need it installed."""
+    Same latest-frame slot interface as CameraReader, and freezes the sensor
+    settings from the spec if given. pyrealsense2 is imported lazily, so
+    v4l2-only setups never need it installed.
+    """
 
     def __init__(self, spec: CameraSpec) -> None:
         import pyrealsense2 as rs
@@ -226,9 +202,8 @@ class RealSenseCameraReader:
                 frames = self._pipe.wait_for_frames(timeout_ms=1000)
             except RuntimeError:
                 now = time.time()
-                # Silent since RealSenseCameraReader.__init__ — no frame has
-                # ever arrived, or delivery stalled. Rate-limited so a real
-                # outage doesn't spam the log every 1s wait_for_frames retry.
+                # No frame has ever arrived, or delivery stalled. Rate-limited
+                # so a real outage doesn't spam every wait_for_frames retry.
                 if now - last_frame_at > 3.0 and now - last_stall_warn > 5.0:
                     last_stall_warn = now
                     logger.warning("camera %s: no frame in %.1fs (wait_for_frames timing out) — "
@@ -269,12 +244,8 @@ class CameraTrack(VideoStreamTrack):
         self.reader = reader
         self.enabled = True
         self._last_sent: np.ndarray | None = None
-        # Pre-build a black fallback so the encoder has *something* to chew
-        # on if the camera hasn't produced a frame yet by the first recv().
-        # 90/270 rotations swap the frame dimensions; crop_height (applied
-        # after rotate in both readers' _loop()) shrinks whichever axis is
-        # "height" post-rotation — match that order here or this fallback's
-        # shape disagrees with what the reader actually produces.
+        # Black fallback, so the encoder has something before the first frame.
+        # Rotate then crop, matching _loop(), or the shapes disagree.
         h, w = reader.spec.height, reader.spec.width
         if reader.spec.rotate in (90, 270):
             h, w = w, h
@@ -300,18 +271,7 @@ class CameraTrack(VideoStreamTrack):
 
 
 # ── Camera registry ──────────────────────────────────────────────────────
-# Only cameras that are actually present get registered (v4l2: device path
-# exists; RealSense: trust the config, since serials aren't checkable
-# without opening the device). The Quest UI is populated from this list
-# (camera_list message on WS open), so missing cameras silently disappear
-# instead of erroring at peer-connect time.
-#
-# Two ways to configure the camera set:
-#   1. VR_TELEOP_CAMERAS_YAML=/path/to/cameras.yaml — arbitrary cameras by
-#      id, v4l2 or RealSense (see robots/yam_ultra/config/cameras.yaml for the
-#      format). Takes priority if set.
-#   2. CAM_TOP / CAM_LEFT / CAM_RIGHT env vars — a legacy fixed 3-slot
-#      v4l2 setup this relay originally shipped with.
+# Only cameras actually present are registered, so a missing one disappears.
 
 def _load_camera_specs_from_yaml(path: Path, width: int, height: int, fps: int) -> list[CameraSpec]:
     import yaml
@@ -402,8 +362,7 @@ def _ensure_readers() -> None:
 
 
 # ── Codec preference ─────────────────────────────────────────────────────
-# Force H.264 because Quest's hardware video decoder is H.264-strongest.
-# VP8 is software-decoded → higher CPU, worse latency under load.
+# Quest decodes H.264 in hardware; VP8 is software-decoded, so worse latency.
 
 def _prefer_h264(pc: RTCPeerConnection) -> None:
     caps = RTCRtpSender.getCapabilities("video")
@@ -416,8 +375,7 @@ def _prefer_h264(pc: RTCPeerConnection) -> None:
 
 
 # ── Per-WebSocket client state ───────────────────────────────────────────
-# Each WS holds its own RTCPeerConnection + the live CameraTracks it added.
-# We key tracks by camera id so camera_toggle messages can flip the right one.
+# Each WS owns its peer connection and tracks, keyed by camera id.
 
 @dataclass
 class ClientState:
@@ -472,15 +430,7 @@ async def index() -> FileResponse:
 
 
 # ── WebRTC signaling ─────────────────────────────────────────────────────
-# Server-as-publisher pattern:
-#   1. Client sends `webrtc_request` (optionally with enabled_cameras list).
-#   2. Server creates PC, adds CameraTracks, generates *offer*, sends back
-#      as `webrtc_offer` carrying a `cameras` list ({id, label}). The client
-#      matches incoming tracks to cameras via MediaStream.id, which we force
-#      to the camera id (sender._stream_id below).
-#   3. Client sets remote desc, generates *answer*, sends `webrtc_answer`.
-#   4. The client trickles `ice_candidate` messages; the server drops them
-#      (see ws_handler — the offer SDP already carries our candidates).
+# Server-as-publisher. Trickled ICE is dropped; the offer SDP carries ours.
 
 async def _handle_webrtc_request(state: ClientState, msg: dict) -> None:
     if state.pc is not None:
@@ -501,10 +451,8 @@ async def _handle_webrtc_request(state: ClientState, msg: dict) -> None:
         track = CameraTrack(reader)
         track.enabled = spec.id in enabled_set
         sender = pc.addTrack(track)
-        # Force the MediaStream id to the camera id. aiortc otherwise
-        # assigns a random UUID, leaving the client unable to associate
-        # an incoming track with a UI slot without scraping SDP msid.
-        # Private attr, but stable across aiortc 1.9+.
+        # aiortc otherwise assigns a random UUID, leaving the client unable to
+        # match a track to a UI slot. Private attr, stable across aiortc 1.9+.
         sender._stream_id = spec.id
         state.tracks[spec.id] = track
 
@@ -567,9 +515,8 @@ async def ws_handler(websocket: WebSocket) -> None:
     peer = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "?"
     logger.info("ws connect %s  (now %d clients)", peer, len(_clients))
 
-    # Tell the client which cameras exist before any signaling starts. The
-    # UI uses this to render the toggle row even if the operator hasn't
-    # asked for video yet.
+    # Before signaling, so the UI can render the toggle row even if the
+    # operator has not asked for video yet.
     await websocket.send_text(json.dumps({
         "type": "camera_list",
         "cameras": [{"id": s.id, "label": s.label} for s in CAMERA_SPECS],
@@ -597,18 +544,14 @@ async def ws_handler(websocket: WebSocket) -> None:
             elif t == "webrtc_answer":
                 await _handle_webrtc_answer(state, msg)
             elif t == "ice_candidate":
-                # Trickle ICE from the browser — intentionally dropped.
-                # aiortc gathers all local candidates before the offer is
-                # sent (non-trickle), so on LAN the connection establishes
-                # from the SDP candidates alone.
+                # Dropped on purpose: aiortc gathers all local candidates before
+                # offering, so on LAN the SDP candidates alone suffice.
                 pass
             elif t == "camera_toggle":
                 await _handle_camera_toggle(state, msg)
             elif t == "latency_report":
-                # Client-side RTT stats from latency mode (?latency=1). Logged
-                # here so transport comparisons (USB vs LAN) can be read off the
-                # workstation terminal. `host` self-labels the transport
-                # (localhost:8443 = USB tether, <lan-ip>:8443 = LAN).
+                # RTT stats from ?latency=1, logged so USB-vs-LAN comparisons
+                # can be read off the workstation terminal. `host` self-labels.
                 logger.info(
                     "latency_report host=%s n=%s mean=%.1f p50=%.1f p95=%.1f min=%.1f max=%.1f ms (one-way~%.1f)",
                     msg.get("host"), msg.get("n"),

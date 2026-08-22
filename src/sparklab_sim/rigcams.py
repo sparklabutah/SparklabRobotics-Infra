@@ -1,19 +1,11 @@
-"""Sim cameras that match the real rig's spec — resolution and field of view.
+"""Sim cameras matching the real rig's resolution and field of view.
 
 Reads ``robots/yam_ultra/config/{cameras,intrinsics}.yaml``, the same files the
-relay and the recording follower use, so there is one source of truth for what
-cameras exist and what they see.
+relay and the recording follower use. FOV is derived from the measured ``fx``.
 
-WHAT THIS GETS RIGHT
-Field of view, derived from the measured ``fx``. A rendered frame at the right
-resolution but the wrong FOV looks plausible and compares badly against a
-recorded one, and the error is easy to mistake for a pose error.
-
-WHAT IT DOES NOT
-Where the wrist cameras are. They ride each arm's link6, but the mount
-transform is an un-done hand-eye calibration and the URDF has no camera links
-at all. The placeholder below is a guess, flagged as such; every wrist render
-is therefore the right lens in the wrong place.
+The wrist camera POSES are guesses: they ride each arm's link6, but that mount
+transform is an un-done hand-eye calibration and the URDF has no camera links.
+Every wrist render is the right lens in the wrong place.
 """
 
 from __future__ import annotations
@@ -27,9 +19,8 @@ from . import paths, scene
 # with the focal length computed against it — only the ratio matters.
 _H_APERTURE_MM = 20.955
 
-# Placeholder wrist-camera mount, in the gripper link's frame: roughly above
-# and behind the grasp point, looking along the approach direction.
-# ASSUMED — replace with a hand-eye calibration result.
+# ASSUMED, in the gripper link's frame: above and behind the grasp point,
+# looking along the approach. Replace with a hand-eye calibration.
 _WRIST_MOUNT_XYZ = (0.04, 0.0, -0.03)
 _WRIST_MOUNT_RPY_DEG = (0.0, 25.0, 0.0)
 
@@ -38,9 +29,7 @@ def load_specs() -> dict:
     """``{camera_id: {...}}`` merging cameras.yaml with intrinsics.yaml.
 
     Rescales ``fx``/``fy`` when the intrinsics were exported at a different
-    resolution than the camera is captured at — the D405s report 848x480 but
-    are captured at 640x480, and using the raw fx would give a ~32% too-narrow
-    field of view.
+    resolution than the camera is captured at.
     """
     cams = yaml.safe_load(paths.YAM_ULTRA_CONFIG_DIR.joinpath("cameras.yaml")
                           .read_text())["cameras"]
@@ -80,11 +69,10 @@ def _apply_intrinsics(cam, fx: float, fy: float, width: int, height: int) -> Non
 def add_rig_cameras(stage, specs: dict | None = None) -> dict:
     """Create sim cameras for every camera in the rig config.
 
-    Returns ``{camera_id: {"path": prim_path, "resolution": (w, h)}}``.
+    ``top`` is placed from ``rig.py``; the wrist cameras are parented to their
+    arm's gripper link so they follow FK, with a placeholder mount.
 
-    ``top`` is placed from ``rig.py`` (lateral position measured, standoff and
-    height assumed). The wrist cameras are parented to their arm's gripper link
-    so they follow FK — with a PLACEHOLDER mount, see the module docstring.
+    Returns: ``{camera_id: {"path": prim_path, "resolution": (w, h)}}``.
     """
     from pxr import Gf, UsdGeom
 

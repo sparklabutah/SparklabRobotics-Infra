@@ -35,30 +35,26 @@ logger = logging.getLogger(__name__)
 ARM_JOINTS = 6
 HANDS = ("left", "right")
 
-# Most recently connect()ed instance, so BiQuestTeleoperator.connect() can
-# auto-seed itself: lerobot-record offers no hook between robot.connect() and
-# teleop.connect().
+# Most recently connected instance: lerobot-record offers no hook between
+# robot.connect() and teleop.connect(), so the teleop seeds itself from this.
 _LAST_CONNECTED: "YamUltraFollower | None" = None
 
 
 def get_last_connected_follower() -> "YamUltraFollower | None":
     return _LAST_CONNECTED
 
-# One level up, not two: the rig's serials live with the robot. Getting this
-# wrong is quiet — _default_cameras() returns {} and the follower comes up with
-# no cameras at all, so a policy expecting observation.images.* silently
-# receives a dict without them.
+# Wrong path fails quietly: _default_cameras() returns {} and the follower comes
+# up with no cameras, so a policy just receives an observation without them.
 _CAMERAS_YAML = Path(__file__).parent / "config" / "cameras.yaml"
 
 
 def _default_cameras() -> dict[str, CameraConfig]:
-    """RealSense cameras from config/cameras.yaml. Returns {} if the file is
-    missing, so the follower still works headless.
+    """RealSense cameras from config/cameras.yaml, or {} if the file is missing.
 
-    ``height`` is the sensor's NATIVE capture height and must be a profile the
-    sensor really offers (the D405 wrists only do 640x480). The yaml's optional
-    ``crop_height`` is deliberately not passed here — cropping happens after
-    capture in ``_read_camera()``."""
+    The yaml's ``height`` is the sensor's native capture height and must be a
+    profile it really offers. Its optional ``crop_height`` is applied after
+    capture in ``_read_camera()``, not here.
+    """
     if not _CAMERAS_YAML.exists():
         logger.warning("%s not found — YamUltraFollower will have no default cameras",
                         _CAMERAS_YAML)
@@ -76,9 +72,7 @@ def _default_cameras() -> dict[str, CameraConfig]:
 
 
 def _default_camera_crop_heights() -> dict[str, int]:
-    """name -> crop_height for cameras whose yaml entry sets one. Separate from
-    ``_default_cameras()`` because it is post-capture processing, not what gets
-    requested from the sensor."""
+    """name -> crop_height for cameras whose yaml entry sets one."""
     if not _CAMERAS_YAML.exists():
         return {}
     data = yaml.safe_load(_CAMERAS_YAML.read_text()) or {}
@@ -90,9 +84,9 @@ def _default_camera_crop_heights() -> dict[str, int]:
 def _center_crop_height(frame: np.ndarray, target_h: int) -> np.ndarray:
     """Crop rows evenly off top and bottom to reach ``target_h``.
 
-    For matching a reference dataset's shorter frames without rescaling — a
-    center crop preserves pixel scale. No-op if ``target_h`` is not smaller,
-    so it is safe to call unconditionally."""
+    Matches a reference dataset's shorter frames without rescaling, preserving
+    pixel scale. No-op if ``target_h`` is not smaller.
+    """
     h = frame.shape[0]
     if target_h >= h:
         return frame
@@ -113,14 +107,14 @@ class YamUltraFollowerConfig(RobotConfig):
     right_server_port: int = 11334
     sim: bool = False
     
-    # Invert the gripper mapping on both arms (see module docstring).
+    # Invert the gripper mapping on both arms.
     gripper_flip: bool = False
 
     max_relative_target: float | list[float] | None = field(
         default_factory=lambda: [0.133, 0.133, 0.133, 0.15, 0.15, 0.15]
     )
 
-    # Ramp the arms back to the pose they were in at connect()
+    # Ramp the arms to the zero pose on disconnect, where torque is safe to cut.
     park_on_disconnect: bool = True
     park_duration_s: float = 5.0
 
@@ -141,12 +135,10 @@ class YamUltraFollower(Robot):
         self._n_dofs: dict[str, int] = {}
         self._connected = False
         self._last_clamp_warn: dict[str, float] = {}  # hand -> monotonic ts
-        # Last pose commanded per hand; send_action seeds from it so an
-        # omitted joint holds.
+        # send_action seeds from this, so a joint the action omits holds.
         self._last_sent_qpos: dict[str, np.ndarray] = {}
 
-        # Per-tick Δq cap, resolved once. Broadcast covers a scalar; None means
-        # the caller clamps on its own terms (teleop_bimanual.py does).
+        # Per-tick Δq cap, resolved once. None means the caller clamps itself.
         mrt = config.max_relative_target
         self._caps: np.ndarray | None = (
             None if mrt is None
@@ -159,8 +151,8 @@ class YamUltraFollower(Robot):
         # Built up-front so is_connected can poll them; no device opened yet.
         self.cameras = make_cameras_from_configs(config.cameras)
 
-    # Joint keys per hand, in the arm's own position-vector order. One shared
-    # definition for the three dict <-> array marshalling sites below.
+    # In the arm's own position-vector order; shared by the three marshalling
+    # sites below.
     _ARM_KEYS = {h: tuple(f"{h}_joint_{j}.pos" for j in range(1, ARM_JOINTS + 1))
                  for h in HANDS}
     _GRIPPER_KEYS = {h: f"{h}_gripper.pos" for h in HANDS}
@@ -176,7 +168,7 @@ class YamUltraFollower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        # Post-crop height, to match what _read_camera() actually returns.
+        # Post-crop, to match what _read_camera() actually returns.
         return {
             name: (self.config.camera_crop_heights.get(name, self.config.cameras[name].height),
                    self.config.cameras[name].width, 3)
@@ -194,9 +186,8 @@ class YamUltraFollower(Robot):
     # ---- connection ---------------------------------------------------------
     @property
     def is_connected(self) -> bool:
-        # _arms_alive() matters: the control loop can die at any point and
-        # get_joint_pos() keeps returning the last pose it read, so the robot
-        # looks fine while every command goes nowhere.
+        # _arms_alive() matters: a dead control loop keeps returning the last
+        # pose read, so the robot looks fine while commands go nowhere.
         return (self._connected
                 and self._arms_alive()
                 and all(c.is_connected for c in self.cameras.values()))
@@ -234,8 +225,8 @@ class YamUltraFollower(Robot):
             self.configure()
             self._assert_arms_alive("connect")
 
-            # Informational: a pose far from zero means the arms were not left
-            # folded, so the first park will be a long move.
+            # A pose far from zero means the arms were not left folded, so the
+            # first park will be a long move.
             start_qpos = {h: np.asarray(self._robots[h].get_joint_pos(), dtype=float)[:ARM_JOINTS]
                           for h in HANDS}
             for h in HANDS:
@@ -255,20 +246,20 @@ class YamUltraFollower(Robot):
         logger.info("%s connected (%d cameras).", self, len(self.cameras))
 
     def _spawn_sim_servers(self) -> None:
-        """Start the two arm_servers ourselves, in --sim mode, so
-        ``--robot.sim=true`` stays one self-contained flag.
+        """Start both arm_servers in --sim mode, so ``--robot.sim=true`` is one
+        self-contained flag.
 
-        Hardware deliberately does not do this: those servers own torque,
-        outlive any one run, and park on their own exit."""
+        Hardware deliberately does not: those servers own torque, outlive any
+        one run, and park on their own exit.
+        """
         import ctypes
         import signal
         import subprocess
         import sys
 
         def _die_with_parent() -> None:
-            """PR_SET_PDEATHSIG, so a hard kill of the parent cannot leave
-            orphaned sim servers squatting on the real ports and silently
-            absorbing the next hardware run."""
+            """PR_SET_PDEATHSIG, so a hard kill of the parent cannot leave orphans
+            squatting on the real ports and absorbing the next hardware run."""
             ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)
 
         specs = [(self.config.left_channel, self.config.left_server_port),
@@ -278,14 +269,12 @@ class YamUltraFollower(Robot):
             self._sim_servers.append(subprocess.Popen(
                 [sys.executable, "-m", "lerobot_robot_sparklab.robots.yam_ultra.arm_server",
                  "--channel", channel, "--port", str(port), "--sim",
-                 # Nothing physical to drop, and skipping the ramp keeps
-                 # teardown fast for tests.
+                 # Nothing physical to drop; skipping the ramp speeds teardown.
                  "--no-park-on-exit"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 preexec_fn=_die_with_parent,
             ))
-        # YamArmClient.connect() retries for its connect_timeout_s, so there
-        # is no sleep here — it absorbs the servers' startup.
+        # No sleep here: YamArmClient.connect() retries, absorbing the startup.
 
     def _stop_sim_servers(self) -> None:
         for proc in self._sim_servers:
@@ -300,16 +289,19 @@ class YamUltraFollower(Robot):
         self._sim_servers.clear()
 
     def _arms_alive(self) -> bool:
-        """False once i2rt's control loop has died on any arm. Reads a cached
-        flag that rides back on every response, so it is free to check on every
-        I/O — and worth it: a dead chain keeps answering ``get_joint_pos`` with
-        the last pose it read, so nothing else reveals it."""
+        """False once i2rt's control loop has died on any arm.
+
+        Reads a cached flag that rides back on every response, so it is free to
+        check on every I/O — and worth it, since nothing else reveals a dead chain.
+        """
         return all(robot.is_alive() for robot in self._robots.values())
 
     def _require_live(self, where: str) -> None:
-        """Gate for the I/O methods, replacing ``@check_if_not_connected``:
-        that decorator keys off ``is_connected``, which is also False on a dead
-        control loop, so it would blame "not connected" for a lost CAN link."""
+        """Gate for the I/O methods, replacing ``@check_if_not_connected``.
+
+        That decorator keys off ``is_connected``, which is also False on a dead
+        control loop, so it would blame "not connected" for a lost CAN link.
+        """
         if not self._connected:
             raise DeviceNotConnectedError(
                 f"{self.__class__.__name__} is not connected. Run `.connect()` first."
@@ -328,8 +320,7 @@ class YamUltraFollower(Robot):
             "do nothing while appearing to work."
         )
 
-    # i2rt homes its own encoders on connect; there is no LeRobot-style
-    # calibration file, so calibration is always considered satisfied.
+    # i2rt homes its own encoders on connect; there is no calibration file.
     @property
     def is_calibrated(self) -> bool:
         return True
@@ -345,7 +336,7 @@ class YamUltraFollower(Robot):
         self._require_live("get_observation")
         obs: dict[str, object] = {}
         
-        # Issue both reads before awaiting either, to overlap the round trips.
+        # Both issued before either is awaited, to overlap the round trips.
         futs = {h: self._robots[h].read_async() for h in HANDS}
         for h in HANDS:
             q = np.asarray(self._robots[h].collect(futs[h])["pos"], dtype=float)
@@ -362,9 +353,11 @@ class YamUltraFollower(Robot):
         return obs
 
     def _read_camera(self, name: str, cam) -> np.ndarray:
-        """One camera frame. A stale frame raises rather than being reused:
-        handing a policy an image of a scene that no longer exists fails
-        invisibly, which is worse than failing loudly."""
+        """One camera frame, cropped if the rig config asks for it.
+
+        A stale frame raises rather than being reused — handing a policy an
+        image of a scene that no longer exists fails invisibly.
+        """
         frame = cam.read_latest()
 
         crop_h = self.config.camera_crop_heights.get(name)
@@ -373,22 +366,18 @@ class YamUltraFollower(Robot):
         return frame
 
     def _dq_caps(self) -> np.ndarray | None:
-        """Per-joint Δq allowance (rad) for one tick, or None if uncapped.
-        """
+        """Per-joint Δq allowance (rad) for one tick, or None if uncapped."""
         return self._caps
 
     def _target_qpos(self, hand: str, action: RobotAction) -> np.ndarray:
         """One arm's requested pose, as its own absolute position vector.
 
-        Marshalling only — no clamping (the arm server does that, against a
-        pose it reads under the motor lock) and no state written back.
+        Marshalling only: the arm server clamps, against a pose it reads under
+        the motor lock. The baseline is the last *clamped* value the server
+        reported, so a clamped joint cannot accumulate a phantom offset.
 
-        Starts from the last pose actually commanded, so a joint the action
-        omits holds rather than being driven home. That baseline is the
-        *clamped* value the server reported, not what was last requested:
-        seeding from the request would let a clamped joint accumulate a
-        phantom offset and leave this side believing the arm is somewhere it
-        was never allowed to reach.
+        hand: "left" or "right".
+        action: `.pos` keys; omitted joints hold their last commanded value.
         """
         last = self._last_sent_qpos.get(hand)
         cmd = last.copy() if last is not None else np.zeros(self._n_dofs[hand])
@@ -404,17 +393,19 @@ class YamUltraFollower(Robot):
         return cmd
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Command both arms. Returns the action actually sent (Δq-clamped),
-        in the same action-space keys/units that were passed in."""
+        """Command both arms.
+
+        Returns: the action actually sent, Δq-clamped, in the same keys and
+        units that were passed in.
+        """
         self._require_live("send_action")
         caps = self._dq_caps()
         sent: dict[str, float] = {}
 
-        # One combined read+clamp+command per arm, both issued before either is
-        # awaited: 2 round trips per tick instead of 4.
+        # One combined read+clamp+command per arm: 2 round trips, not 4.
         targets = {h: self._target_qpos(h, action) for h in HANDS}
 
-        # Fire both arms, then collect — overlapping the round trips.
+        # Fire both, then collect, overlapping the round trips.
         futs = {h: self._robots[h].command_clamped_async(targets[h], caps, ARM_JOINTS)
                 for h in HANDS}
 
@@ -423,13 +414,12 @@ class YamUltraFollower(Robot):
             cmd = np.asarray(out["sent"], dtype=float)
             self._last_sent_qpos[h] = cmd.copy()
 
-            # Absent only if talking to an arm_server predating the field; the
-            # default is not spelled as get(..., zeros(6)) because that would
-            # allocate the throwaway on every tick, key present or not.
+            # Absent only against an arm_server predating the field. Not spelled
+            # get(..., zeros(6)): that allocates every tick, key present or not.
             overshoot = out.get("overshoot")
             if overshoot is not None and np.any(overshoot):
                 # Rate-limited: sustained clamping is normal when the teleop's
-                # own cap exceeds ours, and would bury every other log line.
+                # cap exceeds ours, and would bury every other log line.
                 now = time.monotonic()
                 if now - self._last_clamp_warn.get(h, 0.0) > 1.0:
                     self._last_clamp_warn[h] = now
@@ -440,7 +430,7 @@ class YamUltraFollower(Robot):
                         h, float(caps[worst]) if caps is not None else float("nan"),
                         worst + 1, float(overshoot[worst]))
 
-            # Back to action-space: gripper un-flipped to the caller's 0..1.
+            # Back to action space, gripper un-flipped to the caller's 0..1.
             sent.update(zip(self._ARM_KEYS[h], cmd[:ARM_JOINTS].tolist()))
             gripper_key = self._GRIPPER_KEYS[h]
             if self._n_dofs[h] > ARM_JOINTS:
@@ -453,22 +443,17 @@ class YamUltraFollower(Robot):
 
     def park(self, hands: Sequence[str] | None = None, duration_s: float | None = None,
              rate_hz: float = 50.0) -> None:
-        """Ramp arms to the zero pose and hold. Safe to cut torque there.
+        """Ramp arms to the zero pose and hold, where torque is safe to cut.
 
-        Zero, not a pose captured at connect(): a captured pose is merely
-        wherever the arm was, so a run ending mid-air would park to mid-air and
-        then cut torque.
+        Zero rather than a pose captured at connect(), which would park a run
+        that ended mid-air to mid-air. Bypasses send_action's Δq clamp: this is
+        a slow bounded move to a known-safe pose, not operator input. Blocks.
 
-        ``hands`` defaults to both; pass e.g. ``["left"]`` to stow one arm and
-        leave the other under teleop control. Both ramps start before either is
-        awaited, so the arms move together.
-
-        Bypasses send_action's Δq clamp deliberately — a slow, bounded move to a
-        known-safe pose, not operator input. Blocks for ``duration_s``. No-op
-        with a warning if the control loop is dead.
-
-        ``rate_hz`` is unused (move_joints fixes its own step count); kept so
-        existing callers don't break."""
+        hands: defaults to both; pass ["left"] to stow one and leave the other
+            under teleop control. Both ramps start before either is awaited.
+        duration_s: ramp length; defaults to the config value.
+        rate_hz: unused, kept for callers. No-op if the control loop is dead.
+        """
         hands = tuple(HANDS if hands is None else hands)
         if not self._robots:
             logger.warning("park(): no arms connected — skipping")
@@ -488,8 +473,8 @@ class YamUltraFollower(Robot):
         logger.info("parking %s arm(s): ramping to zero over %.1fs ... [called by %s]",
                     "+".join(hands), duration_s, caller)
         try:
-            # Start both before awaiting either — the call blocks server-side
-            # for the whole ramp, so awaiting one first parks serially.
+            # The call blocks server-side for the whole ramp, so awaiting one
+            # first would park the arms serially.
             futures = {h: self._robots[h].park_async(duration_s) for h in hands}
             for h, fut in futures.items():
                 if not bool(fut.result(timeout=duration_s + 30.0)["ok"]):
@@ -504,16 +489,16 @@ class YamUltraFollower(Robot):
         logger.info("parked %s at zero pose.", "+".join(hands))
 
     def disconnect(self) -> None:
-        """Release both arms and every camera.
+        """Release both arms and every camera, each step guarded independently.
 
-        NOT guarded by ``@check_if_not_connected``: ``is_connected`` goes False
-        the moment the control loop dies, which is exactly when cleanup matters
-        most — a refused disconnect leaves the cameras claimed until the process
-        exits. Each step is guarded independently."""
+        Not decorated with ``@check_if_not_connected``: ``is_connected`` goes
+        False the moment the control loop dies, which is when cleanup matters
+        most — a refused disconnect leaves the cameras claimed.
+        """
         if not self._connected:
             return
 
-        # Park BEFORE close(): close() cuts torque where the arm stands.
+        # Before close(), which cuts torque wherever the arm stands.
         if self.config.park_on_disconnect:
             try:
                 self.park()

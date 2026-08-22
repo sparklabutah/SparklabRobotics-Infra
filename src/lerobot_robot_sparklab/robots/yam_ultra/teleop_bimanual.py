@@ -1,35 +1,19 @@
 """Drive both physical YAM-Ultra arms with Quest teleop, with arm/disarm.
 
-One BiQuestTeleoperator (single IK loop, both hands) driving a
-YamUltraFollower (the same LeRobot Robot adapter `lerobot-record` uses —
-see follower.py). Action keys `left_*` go to --left-channel,
-`right_*` to --right-channel; if your rig is wired mirrored, swap the
-channel flags rather than the controllers.
+One BiQuestTeleoperator driving a YamUltraFollower. Action keys `left_*` go to
+--left-channel, `right_*` to --right-channel; swap the flags, not the
+controllers, on a mirrored rig. Cameras are disabled here — the relay already
+owns the RealSense devices, and two processes cannot share a serial.
 
-Cameras are disabled on the Follower here (`cameras={}`): the relay
-already owns the physical RealSense devices for the live VR view
-(robots/yam_ultra/config/cameras.yaml), and two processes can't open the
-same RealSense serial at once.
+The startup pose of each arm is captured as HOME; every automatic motion
+targets it and nothing ever raises an arm on its own. Starts DISARMED. B/Y on
+either hand arms it, seeded from the measured pose; B/Y again disarms and ramps
+both arms home. Grip clutches, trigger drives the gripper, A/X is precision,
+thumbstick ramps that arm home. Ctrl-C ramps home then torques off; --no-park
+skips the ramp::
 
-The pose each arm is in at startup (folded, resting) is captured as its
-HOME pose — every automatic motion targets that pose and nothing ever
-raises the arm on its own:
-
-  * The bridge starts DISARMED, holding home.
-  * B/Y (either hand) → ARM: the teleop is seeded from the robots'
-    measured pose and control goes live immediately — no motion until
-    you squeeze a grip and move. (grip = clutch, trigger = gripper,
-    A/X = precision, thumbstick = ramp that arm back to home.)
-  * B/Y again → DISARM: both arms automatically ramp back to home and
-    hold; controller input is ignored until re-armed.
-
-Ctrl-C: ramps home if needed, then torques off (home is the mechanical
-resting pose, so torques-off there is safe). --no-park skips the ramp.
-
-Run (relay + viewers up first):
-    python -m lerobot_robot_sparklab.robots.yam_ultra.teleop_bimanual --ws-url wss://127.0.0.1:8443/ws
-
-Dry-run without hardware:  add --sim
+    python -m lerobot_robot_sparklab.robots.yam_ultra.teleop_bimanual \
+        --ws-url wss://127.0.0.1:8443/ws        # add --sim for no hardware
 """
 
 from __future__ import annotations
@@ -82,9 +66,8 @@ def seed_from_follower(teleop: BiQuestTeleoperator, follower: YamUltraFollower) 
 
 
 def main() -> None:
-    # If a parent shell spawned us in the background, SIGINT arrives ignored
-    # and Python never installs KeyboardInterrupt — restore it so Ctrl-C (or
-    # a launcher's forwarded INT) always triggers the safe go-home shutdown.
+    # A background job inherits SIGINT ignored, so Python never installs
+    # KeyboardInterrupt; restore it so Ctrl-C always reaches the safe shutdown.
     import signal
     signal.signal(signal.SIGINT, signal.default_int_handler)
 

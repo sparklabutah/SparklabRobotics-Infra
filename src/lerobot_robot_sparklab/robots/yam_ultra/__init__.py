@@ -57,13 +57,11 @@ if not _DEFER:
         _skipped("yam_ultra_bimanual", exc)
 
 # --- Isaac-backed simulator -------------------------------------------------
-# Unguarded on purpose: "yam_ultra_sim" is unique here, so a collision is a
-# genuine conflict. Imports nothing from follower.py, so it survives the skip.
+# Unguarded: "yam_ultra_sim" is unique here, so a collision is a real conflict.
 from .sim_follower import YamUltraSim, YamUltraSimConfig  # noqa: F401,E402
 
 # --- teleoperators ----------------------------------------------------------
-# Do NOT pre-bind `teleop = None` above this: `from . import teleop` only imports
-# the submodule when the parent lacks the attribute, so it would silently no-op.
+# Do NOT pre-bind `teleop = None` above this — the import would silently no-op.
 if not _DEFER:
     try:
         from . import teleop  # noqa: F401

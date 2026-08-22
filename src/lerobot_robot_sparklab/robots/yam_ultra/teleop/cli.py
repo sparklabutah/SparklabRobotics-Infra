@@ -1,6 +1,7 @@
-"""Shared helpers for the VR-teleop entry points (`tools/pure_sim.py`,
-`robots/yam_ultra/teleop_bimanual.py`). Each script defines its own loop and CLI;
-this module holds the bits that would otherwise be copy-pasted.
+"""Shared helpers for the VR-teleop entry points.
+
+Each script defines its own loop and CLI; this holds what would otherwise be
+copy-pasted between `tools/pure_sim.py` and `teleop_bimanual.py`.
 """
 
 from __future__ import annotations
@@ -10,13 +11,8 @@ import os
 from typing import Any
 
 
-# IK / mapping knobs that both entry points expose on the CLI. Defaults
-# are intentionally None — argparse won't overwrite the dataclass default
-# unless the operator passes the flag. This is the single source of truth
-# for which IK/mapping knobs (damping, reach limits, the wrist park
-# gate, scales, pose filter) get plumbed through, and the dataclass
-# `BiQuestTeleoperatorConfig` is the single source of truth for their
-# values.
+# Defaults are None on purpose, so argparse only overrides the dataclass when
+# the flag is passed. The values themselves live on the config dataclass.
 _IK_CLI_FIELDS: tuple[tuple[str, str, str], ...] = (
     # (CLI flag, argparse dest, help text)
     ("--lam",                "lam",                "Position-solve base damping."),
@@ -51,10 +47,10 @@ def ik_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def parse_rest_pose_env(env_var: str, fallback: list[float]) -> list[float]:
-    """Parse LEFT_REST_POSE / RIGHT_REST_POSE in the same 7-comma format
-    `make rest` consumes (joints 1..6 + gripper). The trailing gripper
-    value is dropped because the teleop sources gripper position from
-    the Quest trigger, not from rest config. Unset or empty → fallback.
+    """Parse LEFT_REST_POSE / RIGHT_REST_POSE, the 7-comma format `make rest` uses.
+
+    The trailing gripper value is dropped: the teleop sources gripper position
+    from the Quest trigger. Unset or empty falls back.
     """
     raw = (os.environ.get(env_var) or "").strip()
     if not raw:

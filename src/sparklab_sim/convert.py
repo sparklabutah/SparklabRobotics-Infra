@@ -2,15 +2,12 @@
 
     <isaac>/python.sh -m sparklab_sim.convert
 
-Boots a headless SimulationApp because the URDF importer is a Kit extension —
-it does not exist until the app has loaded it. That is also why every Isaac
-import in this file sits inside ``main()``.
+Boots a headless SimulationApp because the URDF importer is a Kit extension,
+which is also why every Isaac import here sits inside ``main()``.
 
-The source URDF is the vendored one (i2rt v1.2.4 + this rig's joint3 stop),
-NOT i2rt's installed copy. That matters: the clone is at a pre-v1.2.4 commit
-whose URDF still has the swapped joint2/joint3 limits, and converting it
-would give the twin an elbow that travels 0.66 rad past the real mechanical
-stop.
+The source is the vendored URDF, not i2rt's installed copy: that clone predates
+v1.2.4 and still has the swapped joint2/joint3 limits, which would give the
+twin an elbow travelling 0.66 rad past the real stop.
 """
 
 from __future__ import annotations
@@ -54,9 +51,8 @@ def main() -> int:
         # Anchor the arm to the world: it is bolted to a table, and a
         # floating base would sag under gravity the moment physics ran.
         cfg.fix_base = True
-        # Keep every joint articulated. Merging fixed joints is a rendering
-        # optimisation that also erases link frames — and those frames are
-        # exactly what wrist-camera extrinsics will attach to later.
+        # Merging fixed joints is a rendering optimisation that erases link
+        # frames — exactly what wrist-camera extrinsics will attach to.
         cfg.merge_fixed_joints = False
         # Kinematic posing only, so no drive tuning is meaningful here. Set
         # position targets so the joints are drivable when physics is off.

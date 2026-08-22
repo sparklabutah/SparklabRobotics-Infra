@@ -1,23 +1,11 @@
 """Subscribe to the relay's ``xr_frame`` stream — shared across every robot.
 
-This is the robot-agnostic half of Quest teleoperation: connect to the relay
-over WebSocket, keep the newest controller/headset pose, and report how stale
-it is. Everything about *what to do* with those poses (IK, joint limits,
-action keys, grippers) belongs to a robot's own teleoperator.
+Connects over WebSocket, keeps the newest controller/headset pose, and reports
+how stale it is. What to do with those poses belongs to a robot's teleoperator.
 
-Split out of ``robots/yam_ultra/teleop/bi_quest_teleop.py`` so a second robot
-reuses the plumbing instead of re-deriving it. The pieces that were genuinely
-hard to get right and are worth inheriting:
-
-* **Staleness is reported, not hidden.** ``latest()`` hands back the frame's
-  age; the caller decides. Gating everything on freshness is wrong — a stow
-  button is exactly what an operator reaches for *during* a bad connection,
-  and an early return would eat the press.
-* **Reconnects on its own.** WiFi/tunnel jitter drops the socket; the loop
-  retries rather than ending the session.
-* **Self-signed TLS is accepted deliberately** for ``wss://`` — the relay
-  uses a LAN cert nobody trusts, and this is a dev tool talking to a known
-  machine on the operator's own network.
+Reconnects on its own, and accepts self-signed TLS for ``wss://`` since the
+relay serves a LAN cert. Staleness is reported rather than gated on — see
+``latest()``.
 """
 
 from __future__ import annotations
@@ -47,14 +35,11 @@ def _ssl_context_for(url: str):
 
 
 class XRFrameClient:
-    """Background WebSocket subscriber holding the newest ``xr_frame``.
-
-    Usage::
+    """Background WebSocket subscriber holding the newest ``xr_frame``::
 
         client = XRFrameClient("wss://127.0.0.1:8443/ws")
         client.connect(timeout_s=5.0)
         frame, age_s = client.latest()
-        ...
         client.disconnect()
     """
 
@@ -102,9 +87,8 @@ class XRFrameClient:
     def latest(self) -> tuple[dict | None, float]:
         """Newest frame and its age in seconds.
 
-        Age, not a freshness verdict: some actions (stow, disarm) are safe to
-        take on a stale pose and are exactly what an operator reaches for when
-        the link degrades. Let the caller decide per action.
+        Age rather than a freshness verdict: stow and disarm are safe on a stale
+        pose and are what an operator reaches for when the link degrades.
         """
         with self._lock:
             if self._frame is None:

@@ -3,9 +3,7 @@
     python -m lerobot_robot_sparklab.rollout.ctl                 # localhost:8090
     python -m lerobot_robot_sparklab.rollout.ctl --port 8090
 
-Run it in a second pane. The rollout's own log stays in the first one, so
-typing is not fighting a scrolling log -- which is the practical reason this
-is a separate process rather than a stdin reader inside the loop.
+Run it in a second pane, so typing is not fighting the rollout's scrolling log.
 
 Commands:
 
@@ -55,10 +53,8 @@ def call(base: str, cmd: str, arg: str | None = None, timeout: float = 15.0) -> 
 def parse(line: str) -> tuple[str, str | None] | None:
     """Map a REPL line to (cmd, arg).
 
-    Bare text is treated as a task, because retargeting is what you do most
-    and 'task ' on every line is friction. A line whose first word is a known
-    verb is that verb -- use the explicit 'task' form if your instruction
-    happens to start with one.
+    Bare text is a task, since retargeting is the common case. A line starting
+    with a known verb is that verb — use the explicit 'task' form otherwise.
     """
     line = line.strip()
     if not line:

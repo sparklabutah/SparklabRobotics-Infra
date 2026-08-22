@@ -1,27 +1,15 @@
 """High-level agents that decide WHAT the low-level VLA should be told to do.
 
-The split this package exists to serve:
-
     goal ("clear the table")          <- you, or a caller
       -> high-level agent             <- reasons over camera frames, this file
       -> subtask ("pick up the scissors")
-      -> MolmoAct2                    <- turns a task string + images into joints
+      -> MolmoAct2                    <- task string + images into joints
       -> arms
 
-The VLA already takes a natural-language task and re-plans from scratch when it
-changes (``rollout_live.retarget()`` clears the action queue on every change).
-So the entire integration surface for a high-level agent is: look at the scene,
-emit a new task string when the current one is finished or wrong.
-
-AN AGENT IMPLEMENTS ``decide(goal, frames, state, history) -> Decision``, and
-optionally ``reset()``, which the server calls when the goal changes. Stateless
-agents can omit it.
-
-WHAT AN AGENT MAY DO. Emit a task string and declare the goal complete. That is
-all. It cannot park, reset, or stop the robot -- those stay with the human at
-the console. An agent that can retarget can already move the arms, so this is
-not a security boundary; it is a blast-radius one. A confused agent picks the
-wrong subtask, it does not decide to power down mid-motion.
+An agent implements ``decide(goal, frames, state, history) -> Decision``, plus
+``reset()`` if it holds state. It may emit a task string and declare the goal
+complete — nothing else. Park, reset and stop stay with the human, so a
+confused agent picks the wrong subtask rather than powering down mid-motion.
 """
 
 from __future__ import annotations
@@ -54,9 +42,8 @@ class Decision:
 class ScriptedAgent:
     """Walks a fixed list of subtasks. No API key, no network.
 
-    Here so the whole harness -- server, frontend, retargeting, the robot --
-    can be exercised end to end before any model is wired in. If the arm does
-    not do the right thing under this agent, the problem is not the model.
+    Exercises the whole harness end to end before any model is wired in: if
+    the arm misbehaves under this agent, the problem is not the model.
     """
 
     name = "scripted"
@@ -73,9 +60,8 @@ class ScriptedAgent:
     def reset(self) -> None:
         """Start the list again. Called when the goal changes.
 
-        Without this, setting a new goal left the walker at the end of the old
-        one: the next turn reported "list exhausted" with done=True, so Start
-        armed the loop and the first turn immediately disarmed it.
+        Without this a new goal left the walker at the end of the old list,
+        reporting done=True on the first turn.
         """
         self._i = 0
         self._since = 0.0
@@ -114,16 +100,12 @@ Keep the current instruction by setting "task": null while it is still in progre
 
 
 class GeminiAgent:
-    """Google Gemini as the high-level planner (e.g. a Robotics-ER model).
+    """Google Gemini as the high-level planner.
 
-    The model id is NOT hardcoded — pass ``model=`` or set ``HARNESS_MODEL``.
-    Picking a default here would mean guessing at a name that changes between
-    releases and failing obscurely when it is wrong; failing immediately with
-    "set HARNESS_MODEL" is more useful than a 404 from inside a control loop.
-
-    Needs ``pip install google-genai`` and ``GOOGLE_API_KEY``. Neither is a
-    dependency of this repo: the harness runs fully on ScriptedAgent, and only
-    this class pulls the SDK in.
+    The model id is not hardcoded — pass ``model=`` or set ``HARNESS_MODEL``,
+    so a wrong guess fails at startup rather than as a 404 inside a control
+    loop. Needs ``google-genai`` and ``GOOGLE_API_KEY``, neither a dependency
+    of this repo.
     """
 
     name = "gemini"
@@ -168,9 +150,8 @@ class GeminiAgent:
             )
             data = json.loads((resp.text or "{}").strip())
         except Exception as e:
-            # An agent failure must be visible and non-fatal: the loop keeps the
-            # current task rather than the robot stopping or, worse, being sent
-            # somewhere arbitrary by a half-parsed reply.
+            # Visible and non-fatal: keep the current task rather than stop, or
+            # be sent somewhere arbitrary by a half-parsed reply.
             logger.exception("agent call failed")
             return Decision(error=f"{type(e).__name__}: {e}",
                             reasoning="call failed — keeping current task")

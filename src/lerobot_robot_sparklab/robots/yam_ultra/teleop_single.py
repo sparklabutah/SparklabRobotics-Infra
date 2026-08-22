@@ -1,30 +1,16 @@
 """Drive a physical YAM-Ultra with Quest teleop — single arm.
 
-Bridges the teleop pipeline (relay → SingleArmQuestTeleoperator → IK on
-the YAM model) to an i2rt MotorChainRobot over CAN: each tick, the
-teleop's action dict becomes a 7-vector [joint1..joint6 rad, gripper
-0..1] for `robot.command_joint_pos()`.
+Bridges relay → SingleArmQuestTeleoperator → IK to an i2rt MotorChainRobot over
+CAN: each tick the action dict becomes a 7-vector [joint1..6 rad, gripper 0..1].
 
-Safety model:
-  * On startup the arm does NOT move: the teleop is seeded with the
-    robot's measured joint positions, so the first commands hold pose.
-    (Exception: the gripper self-homes once during driver init — keep
-    fingers clear of it.)
-  * To bring the arm up from its resting pose, click the thumbstick:
-    the teleop ramps to the rest pose over --rest-ramp-s seconds.
-    Then squeeze the grip to engage clutch teleop.
-  * Per-tick Δq caps default to half the sim values (they are rad/tick;
-    at --freq 100 the defaults bound joints 1-3 to 4 rad/s, wrist to
-    16 rad/s worst-case). Raise them once you trust the setup.
-  * Ctrl-C parks the arm: slow interpolated move to the folded zero
-    pose, then torques off. --no-park skips the move (torques off
-    where it stands — hold the arm).
+The arm does not move at startup — the teleop is seeded from the measured
+joint positions, though the gripper self-homes once during driver init. Click
+the thumbstick to ramp to the rest pose, then squeeze the grip to clutch in.
+Δq caps default to half the sim values. Ctrl-C parks to the folded zero pose
+and torques off; --no-park torques off where it stands::
 
-Run (relay + viewer up first, exactly as for pure_sim):
-    python -m lerobot_robot_sparklab.robots.yam_ultra.teleop_single --channel can_right \
-        --ws-url wss://127.0.0.1:8443/ws
-
-Dry-run the full bridge without hardware:  add --sim
+    python -m lerobot_robot_sparklab.robots.yam_ultra.teleop_single \
+        --channel can_right --ws-url wss://127.0.0.1:8443/ws   # --sim to dry-run
 """
 
 from __future__ import annotations
@@ -52,8 +38,8 @@ ARM_JOINTS = 6
 def park_ramp(robot, duration_s: float = 5.0, rate_hz: float = 50.0) -> None:
     """Slow interpolated move of the arm joints to the folded zero pose.
 
-    Plain command_joint_pos ramp (MotorChainRobot.move_joints does the
-    same thing, but SimRobot doesn't have it)."""
+    A plain command_joint_pos ramp, since SimRobot has no move_joints.
+    """
     cur = np.asarray(robot.get_joint_pos(), dtype=float)
     park = cur.copy()
     park[:ARM_JOINTS] = 0.0  # folded resting pose; gripper stays put
@@ -65,9 +51,7 @@ def park_ramp(robot, duration_s: float = 5.0, rate_hz: float = 50.0) -> None:
 
 
 def main() -> None:
-    # Restore Ctrl-C even if a parent shell spawned us with SIGINT ignored
-    # (background jobs of non-interactive shells) — the safe-park shutdown
-    # depends on it.
+    # A background job inherits SIGINT ignored; the safe-park shutdown needs it.
     import signal
     signal.signal(signal.SIGINT, signal.default_int_handler)
 

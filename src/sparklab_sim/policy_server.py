@@ -13,26 +13,13 @@ The matching LeRobot side is ``--robot.type=yam_ultra_sim`` (see
 ``robots/yam_ultra/sim_follower.py``), so a policy rollout against this needs
 no policy changes at all -- same CLI, same observation keys, same units.
 
-WHY A SERVER AND NOT A LIBRARY CALL
-Isaac Sim runs under its own bundled Python 3.12, which has no ``lerobot``;
-importing ``lerobot_robot_sparklab`` there fails immediately because its
-package ``__init__`` imports lerobot to register the robot plugins. The two
-cannot live in one interpreter, so they live in two and speak HTTP. This is
-the same split the repo already uses for the arm servers.
-
-/step IS ONE ROUND TRIP ON PURPOSE. A control tick is act-then-observe, and
-splitting it into POST /action + GET /obs doubles the latency for no benefit.
-GET /obs exists only for the first observation, before any action has been
-sent.
+/step is one round trip on purpose: a control tick is act-then-observe, and
+GET /obs exists only for the first observation, before any action is sent.
 
 ISAAC WORK RUNS ON THE MAIN THREAD, ALWAYS. ``app.update()`` is main-thread
-affine: called from a request handler it does not raise, it simply never
-returns, and the request hangs until the client's timeout while ``/health``
-carries on answering perfectly — which makes it look like a network problem
-rather than a threading one. So handlers do no Isaac work at all. They put a
-job on a queue, block on an Event, and the main loop drains the queue, renders,
-and wakes them. That is also why the main loop polls at 1 ms rather than
-sleeping: it is the only thread that can service a tick.
+affine — called from a request handler it never returns, and the request hangs
+while ``/health`` carries on answering. So handlers put a job on a queue, block
+on an Event, and the main loop drains it. See DESIGN.md.
 
 UNITS, matching meta/stats.json of the recorded dataset:
   * joints  radians, in the URDF's own order and sign
@@ -61,10 +48,8 @@ from pathlib import Path
 def _quat_wxyz_from_matrix(m):
     """Rotation of a row-vector 4x4 transform as (w, x, y, z).
 
-    USD's ComputeLocalToWorldTransform is row-major with translation in the
-    last ROW, so the rotation basis vectors are the first three rows -- and
-    the matrix must be transposed before the usual column-convention
-    extraction, or every prop comes back mirrored.
+    USD's transform is row-major with translation in the last row, so it must
+    be transposed before the usual column-convention extraction.
     """
     r = [[m[i][j] for j in range(3)] for i in range(3)]
     r = [[r[j][i] for j in range(3)] for i in range(3)]      # -> column form
@@ -90,11 +75,8 @@ def _quat_wxyz_from_matrix(m):
 HANDS = ("left", "right")
 ARM_JOINTS = 6
 
-# name -> (camera prim short name, capture size, crop height or None).
-# The wrist cameras capture 4:3 and are cropped, because that is what the
-# hardware does: the D405 has no 640x360 mode at all, so the real rig grabs
-# 640x480 and takes the middle 360 rows. Rendering 640x360 directly here
-# would silently be a different vertical field of view.
+# name -> (camera prim short name, capture size, crop height or None). Wrists
+# capture 4:3 and crop, as hardware does, to keep the vertical FOV right.
 CAMERAS = {
     "top": ("TopCamera", (640, 360), None),
     "left_wrist": ("LeftWristCamera", (640, 480), 360),
@@ -149,10 +131,8 @@ class SimRig:
             for arm in self.arms.values():
                 scene.set_drive_gains(arm)
 
-        # Where every prop started, so /reset can put them back. Captured
-        # BEFORE the first step -- once physics runs the props settle and
-        # possibly get knocked about, and "the pose in the file" is the only
-        # meaningful definition of a scene reset.
+        # Captured before the first step: once physics runs the props settle,
+        # and the pose in the file is the only meaningful definition of a reset.
         self._prop_home = self._capture_props()
 
         found = scene.cameras(self.stage)
@@ -198,7 +178,7 @@ class SimRig:
         """Put every prop back where the scene file had it, at rest.
 
         Zeroing velocity matters as much as the pose: a prop restored
-        mid-flight keeps its momentum and immediately flies off again.
+        mid-flight keeps its momentum and flies off again.
         """
         from isaacsim.core.experimental.prims import RigidPrim
         import numpy as np
@@ -219,12 +199,7 @@ class SimRig:
         return {"reset": moved}
 
     # ---- parking ---------------------------------------------------------
-    # All joints at zero is the YAM's folded rest pose (per the i2rt docs) and
-    # it is where every recorded episode starts: across 49 demos the mean
-    # start pose is left_joint_2 = 0.034, left_joint_3 = 0.022, and no episode
-    # begins anywhere else. Leaving the arm elsewhere between runs puts the
-    # NEXT rollout's first observation outside the training distribution --
-    # measured, an unparked right arm sat 44 sigma off the demo start pose.
+    # Zero is the folded rest pose, and where every recorded episode starts.
     PARK_Q = [0.0] * ARM_JOINTS
     PARK_GRIPPER = 0.0
 
@@ -250,14 +225,11 @@ class SimRig:
     def park(self, duration_s: float = 2.5, fps: float = 30.0) -> dict:
         """Ramp both arms to the folded pose, slowly, and stay there.
 
-        Interpolated over ``duration_s`` rather than written in one go: a
-        single write would teleport in kinematic mode and snap violently in
-        physics mode, and this is meant to be watchable in the viewer -- it is
-        the visible "run finished, workspace tidied" transition.
+        Interpolated rather than written in one go, which would teleport in
+        kinematic mode and snap in physics mode. Blocks the service loop for
+        its duration, deliberately — nothing else should drive the arm here.
 
-        Runs on the main thread like every other Isaac call, so it BLOCKS the
-        service loop for its duration. That is intentional: nothing else
-        should be driving the arm while it parks.
+        duration_s: ramp length.
         """
         steps = max(int(duration_s * fps), 1)
         start = self.current_q()
@@ -272,22 +244,14 @@ class SimRig:
                 action[f"{h}_gripper.pos"] = g0 * (1.0 - t) + self.PARK_GRIPPER * t
             self.apply(action)
             self.app.update()
-            # Pace to wall clock. Without this the ramp runs as fast as
-            # app.update() happens to be -- measured 0.79 s for a requested
-            # 2.0 s, because one update is ~13 ms, not the 33 ms the step
-            # count assumes. `duration_s` should mean what it says, and the
-            # whole point of the ramp is that it is watchable.
+            # Without pacing, the ramp runs as fast as app.update() happens to
+            # be — ~0.79 s for a requested 2.0 s.
             behind = began + i / fps - time.monotonic()
             if behind > 0:
                 time.sleep(behind)
 
-        # Settle. The ramp leaves the joints with VELOCITY -- writing a
-        # position does not clear it -- and the next few app.update() calls
-        # integrate that forward, drifting the arm back off the parked pose.
-        # Measured: up to 0.16 rad of residual once the ramp is paced to wall
-        # clock (real elapsed time means a larger physics dt per update than
-        # the unpaced version had). Zero the velocities, re-assert the pose,
-        # and let it come to rest.
+        # The ramp leaves velocity that writing a position does not clear, and
+        # the next updates integrate it into ~0.16 rad of drift. Zero it.
         import numpy as np
 
         park_action = {}
@@ -315,18 +279,11 @@ class SimRig:
     def apply(self, action: dict) -> None:
         """Send the commanded joint positions to both arms.
 
-        Two modes, and they differ in whether the arm can touch anything:
-
-        ``physics=False`` (default) writes joint state directly. The pose
-        appears immediately and exactly, which is what a rendering/eval loop
-        wants, but the fingers pass through objects -- a teleported body
-        builds no contact force.
-
-        ``physics=True`` writes PD drive targets instead. The arm is pulled
-        toward the target over several steps, so it pushes things, and a
-        closing gripper can hold them. The trade is that the arm LAGS the
-        command and may not arrive at all against an obstruction -- which is
-        the point when the sim stands in for hardware.
+        The two modes differ in whether the arm can touch anything.
+        ``physics=False`` writes joint state directly: exact and immediate, but
+        the fingers pass through objects. ``physics=True`` writes PD drive
+        targets, so contact builds and a gripper can hold — at the cost of the
+        arm lagging the command and maybe never arriving.
         """
         import numpy as np
 
@@ -344,29 +301,24 @@ class SimRig:
 
         state = {}
         for h in HANDS:
-            # Read back from the articulation rather than echoing the command:
-            # a joint driven past its limit clamps, and the policy should see
-            # where the arm actually is.
+            # Read back rather than echo the command: a joint driven past its
+            # limit clamps, and the policy should see where the arm is.
             try:
                 q = np.asarray(self.arms[h].get_dof_positions()).reshape(-1)
             except Exception:
                 q = np.array(self.last_action[h] + [self.last_gripper[h]] * 2)
             for j in range(1, ARM_JOINTS + 1):
                 state[f"{h}_joint_{j}.pos"] = float(q[j - 1])
-            # Fingers are prismatic, -0.04695..0 in the URDF, 0 closed. The
-            # dataset records gripper as 0..1, so map back the same way
-            # scene.pose() maps forward.
+            # Fingers are prismatic, -0.04695..0 in the URDF with 0 closed;
+            # map back the way scene.pose() maps forward.
             if q.size > ARM_JOINTS:
                 state[f"{h}_gripper.pos"] = float(
                     np.clip(abs(q[ARM_JOINTS]) / 0.04695, 0.0, 1.0))
             else:
                 state[f"{h}_gripper.pos"] = self.last_gripper[h]
 
-        # ONE pump for ALL cameras. Every render product advances on the same
-        # app.update(), so pumping per camera does the same global work three
-        # times over: at settle=2 that is 6 updates a tick where 2 will do.
-        # Measured, this is the difference between ~116 ms and ~40 ms per
-        # observation. Hence frame(settle=0) below -- read, do not pump.
+        # One pump for all cameras: every render product advances on the same
+        # app.update(), so per-camera pumping triples the work. Hence settle=0.
         n = self.settle if settle is None else settle
         for _ in range(n):
             self.app.update()
@@ -564,22 +516,14 @@ def main() -> int:
     stopping = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stopping.set())
 
-    # Idle auto-park. A client that exits CLEANLY parks itself on disconnect,
-    # but one that is killed, crashes or loses the connection never gets to --
-    # and that is exactly the case that poisons the next run, because the
-    # abandoned pose becomes the next rollout's captured "initial position".
-    # So the workspace also tidies itself: no ACTION for this long and the
-    # arms ramp home on their own.
-    #
-    # Only /step counts as activity. Polling /obs is watching, not driving,
-    # and must not keep a dead rollout's pose alive indefinitely.
+    # Covers a client killed before it can park, whose abandoned pose would
+    # become the next rollout's start. Only /step counts as activity.
     last_action_at = time.monotonic()
     auto_parked = False
 
     try:
-        # The service loop. This thread is the only one allowed to touch
-        # Isaac, so it must stay responsive: poll at 1 ms rather than sleeping
-        # in 200 ms chunks, or every control tick inherits that latency.
+        # The only thread allowed to touch Isaac, so it polls at 1 ms rather
+        # than sleeping in chunks every control tick would inherit.
         while not stopping.is_set():
             try:
                 job = jobs.get(timeout=0.001)

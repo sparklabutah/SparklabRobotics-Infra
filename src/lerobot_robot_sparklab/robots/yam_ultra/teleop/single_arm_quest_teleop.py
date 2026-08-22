@@ -1,24 +1,13 @@
 """Single-arm adapter around `BiQuestTeleoperator`.
 
-The bimanual `BiQuestTeleoperator` emits action keys prefixed with
-``left_`` / ``right_`` so it can drive `YamUltraFollower`. A single-arm
-follower would expect unprefixed keys like ``joint_1.pos``, so this
-adapter wraps the bimanual teleop and strips the prefix for one chosen
-arm. Useful for DAgger interventions on a policy trained on a single
-arm: the operator can still wear both Quest controllers (one drives,
-the other is idle / used for the B/Y handoff button), but the action
-dict landing on the robot matches the single-arm schema.
+Strips the ``left_`` / ``right_`` prefix for one chosen arm, so a single-arm
+follower expecting ``joint_1.pos`` works while the operator still wears both
+controllers. Registers as ``--teleop.type=single_arm_quest_teleop``; every
+BiQuest knob carries through, plus ``arm``.
 
-Registers as ``--teleop.type=single_arm_quest_teleop`` with a single
-extra config field, ``arm`` ("left" | "right"). All BiQuest knobs
-(ws_url, IK damping, scales, smoothing, etc.) carry through unchanged.
-
-This adapter forwards the DAgger handoff hooks `is_engaged` and
-`is_handoff_pressed` (OR-of-both-arms, so the operator can press B with
-their right hand even when correcting the left). BiQuest's newer
-per-hand hooks (`is_pause_pressed`, `is_reverse_pressed`) are NOT
-forwarded; through this adapter the DAgger listener runs in its
-combined-B/Y fallback.
+Forwards `is_engaged` and `is_handoff_pressed`, OR'd across both arms. The
+per-hand hooks `is_pause_pressed` / `is_reverse_pressed` are not forwarded, so
+a DAgger listener runs in its combined-B/Y fallback here.
 """
 
 from __future__ import annotations
@@ -40,9 +29,8 @@ from .bi_quest_teleop import BiQuestTeleoperator, BiQuestTeleoperatorConfig
 class SingleArmQuestTeleoperatorConfig(BiQuestTeleoperatorConfig):
     """Config for the single-arm Quest teleop adapter.
 
-    Inherits every field from `BiQuestTeleoperatorConfig` (ws_url, IK
-    damping, scales, smoothing, rest poses, …) and adds:
-        arm: which arm's action keys to forward ("left" or "right").
+    Inherits every `BiQuestTeleoperatorConfig` field and adds:
+    arm: which arm's action keys to forward, "left" or "right".
     """
 
     arm: str = "right"
@@ -56,12 +44,7 @@ class SingleArmQuestTeleoperatorConfig(BiQuestTeleoperatorConfig):
 
 
 class SingleArmQuestTeleoperator(Teleoperator):
-    """Wraps `BiQuestTeleoperator` and filters its action dict to one arm.
-
-    Behaves identically to a normal single-arm Teleoperator from the
-    outside (action_features unprefixed; connect/disconnect/get_action
-    standard) and exposes the DAgger handoff hooks unchanged.
-    """
+    """Wraps `BiQuestTeleoperator` and filters its action dict to one arm."""
 
     config_class = SingleArmQuestTeleoperatorConfig
     name = "single_arm_quest_teleop"
@@ -105,10 +88,11 @@ class SingleArmQuestTeleoperator(Teleoperator):
         self._inner.disconnect()
 
     def send_feedback(self, feedback: dict) -> None:
-        """Prefix any unprefixed torque keys (`gripper.torque`) with the
-        configured arm before forwarding to the inner bimanual teleop.
-        Without this, BiQuest's force-haptic dispatcher wouldn't know
-        which arm the gripper torque belongs to."""
+        """Prefix unprefixed torque keys with the configured arm, then forward.
+
+        Without this BiQuest's force-haptic dispatcher cannot tell which arm a
+        gripper torque belongs to.
+        """
         if isinstance(feedback, dict) and isinstance(feedback.get("torques"), dict):
             relabelled: dict[str, float] = {}
             for k, v in feedback["torques"].items():
@@ -129,11 +113,7 @@ class SingleArmQuestTeleoperator(Teleoperator):
         return {k.removeprefix(self._prefix): v for k, v in full.items() if k.startswith(self._prefix)}
 
     # ---------- DAgger handoff hooks ----------
-    # OR across both arms intentionally: the operator may correct the left
-    # arm with one hand and still want to use the right hand's B button as
-    # the policy-handoff signal. The per-hand split hooks
-    # (is_pause_pressed / is_reverse_pressed) are not forwarded here —
-    # see the module docstring.
+    # OR'd across both arms, so either hand's B/Y can signal the handoff.
 
     def is_engaged(self) -> bool:
         return self._inner.is_engaged()

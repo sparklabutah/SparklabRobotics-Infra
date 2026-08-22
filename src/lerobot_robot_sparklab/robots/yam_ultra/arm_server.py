@@ -10,25 +10,13 @@
     │   └ i2rt MotorChainRobot, CAN thread ~88 Hz        │
     └────────────────────────┘  └────────────────────────┘
 
-WHY SPLIT. i2rt's CAN thread must keep sending inside each motor's watchdog
-window. Sharing a GIL with policy inference starved it, and the motors reported
-``loss communication`` (0xD) mid-run while every SocketCAN fault counter read
-zero — the wire was fine, the frames just weren't sent in time. Separate
-process, separate GIL.
-
-WHO OWNS WHAT. This process owns the motors, the CAN link and the torque, and
-holds no policy: the Δq clamp, gripper flip, cameras and park timing all stay
-follower-side. The exception is parking on its own shutdown, because the
-follower cannot help if this process is killed directly.
+This process owns the motors, the CAN link and the torque, and holds no policy:
+the Δq clamp, gripper flip, cameras and park timing all stay follower-side. The
+exception is parking on its own shutdown, which the follower cannot do if this
+process is killed directly. See DESIGN.md for why the split exists.
 
 One tick is two round trips per arm, issued in parallel: ``read`` for joint
-angles, ``command_clamped`` for read+clamp+command under one lock. The follower
-computes ``caps`` (they depend on its measured tick interval, which this process
-cannot know); this end only applies them.
-
-KNOWN COST: portal's client socket spins rather than blocking while a call is in
-flight — ~1 core per client (93% at 4.4 Hz, 118% at 20 Hz, so idle spin rather
-than per-call work). Merging both arms into one server would halve it.
+angles, ``command_clamped`` for read+clamp+command under one lock.
 
 Run one per arm; the follower connects to them, it does not start them:
 
@@ -74,20 +62,18 @@ class ArmServer:
         self._n_dofs = int(self._robot.num_dofs())
         self._lock = threading.Lock()
 
-        # Informational: a startup pose far from zero means the arm was not
-        # left folded, so the first park will be a long move.
+        # A startup pose far from zero means the arm was not left folded, so
+        # the first park will be a long move.
         q = np.asarray(self._robot.get_joint_pos(), dtype=float)
         logger.info("%s pose at startup: %s (park target is zero)",
                     channel, np.round(q[:ARM_JOINTS], 3).tolist())
 
     # ---- liveness -----------------------------------------------------
     def _alive(self) -> bool:
-        """False once i2rt's control loop has died. SimRobots have no
-        motor_chain — treat as alive.
+        """False once i2rt's control loop has died; SimRobots count as alive.
 
-        Rides along with every read/command rather than being its own call: a
-        dead chain keeps answering get_joint_pos() with the last pose it read,
-        so nothing else reveals it.
+        Rides along with every read/command rather than being its own call,
+        since nothing else reveals a dead chain.
         """
         chain = getattr(self._robot, "motor_chain", None)
         if chain is not None and not getattr(chain, "running", True):
@@ -102,9 +88,7 @@ class ArmServer:
         """What this server actually is, so a client can refuse a mismatch.
 
         Nothing else distinguishes a SimRobot from real motors, so an orphaned
-        ``--sim`` server on the real port would absorb a hardware run silently
-        — connected, policy running, arms never moving. Observed. The client
-        checks this at connect.
+        ``--sim`` server on the real port would absorb a hardware run silently.
         """
         return {"n": np.int64(self._n_dofs),
                 "sim": np.bool_(self.sim),
@@ -116,7 +100,7 @@ class ArmServer:
             return {"pos": pos, "alive": np.bool_(self._alive())}
 
     def command(self, data: dict) -> dict:
-        """Command absolute joint positions. Returns liveness so the caller
+        """Command absolute joint positions. Returns liveness, so the caller
         can refresh its cached view without a second call."""
         pos = np.asarray(data["pos"], dtype=float)
         with self._lock:
@@ -126,12 +110,12 @@ class ArmServer:
     def command_clamped(self, data: dict) -> dict:
         """Read present pose, clamp the requested step, command — one call.
 
-        Merges the follower's read-then-command pair to halve the RPC rate
-        (see the module docstring on portal's spin), and closes the window
-        where the arm could move between the two.
+        Halves the RPC rate and closes the window where the arm could move
+        between the read and the command.
 
-        Returns the pose actually commanded plus how far the request overshot
-        the cap, so the caller needs no follow-up read.
+        data: `target` absolute positions, optional `caps`, optional `n_arm`.
+        Returns: `sent` (pose commanded), `overshoot` (how far the request
+            exceeded the cap, per joint) and `alive`.
         """
         target = np.asarray(data["target"], dtype=float)
         caps = data.get("caps")
@@ -153,12 +137,12 @@ class ArmServer:
     def park(self, data: dict | None = None) -> dict:
         """Ramp to the zero pose and hold.
 
-        Zero, not a pose captured at connect: zero is the arm's canonical rest
-        configuration, whereas a captured pose is just wherever the arm was, so
-        a run ending mid-air would park to mid-air and then cut torque.
+        Zero rather than a pose captured at connect, which would park a run
+        that ended mid-air to mid-air. The target includes the gripper, so
+        parking drives it to 0.
 
-        NOTE: the target includes the gripper, so parking drives it to 0. To
-        hold what it is carrying, target ``[zeros(ARM_JOINTS), current]``.
+        data: optional `duration_s` ramp length.
+        Returns: `ok`, False if the control loop is dead or the ramp failed.
         """
         duration_s = float(data.get("duration_s", 5.0)) if data else 5.0
         # Never raise out of the RPC handler: portal tears the connection down

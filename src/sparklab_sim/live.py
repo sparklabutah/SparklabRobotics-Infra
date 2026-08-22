@@ -9,52 +9,20 @@ its ``xformOp:translate``. The camera dropdown switches between free look and
 the cameras authored in the scene, so you can jump from "what am I moving" to
 "what does the rig actually see".
 
-HOW THE FAST PATH WORKS, AND WHY IT IS SHAPED LIKE THIS
-
-The scene file is loaded as a **sublayer** of an anonymous wrapper stage
-rather than opened directly:
+The scene file is loaded as a sublayer of an anonymous wrapper stage rather
+than opened directly::
 
     wrapper stage (anonymous root)
       |- session layer : free camera, overview camera   (never saved)
       `- sublayer      : scene.usda                     (the file you edit)
 
-Reloading then means ``Sdf.Layer.Reload()`` on that one sublayer, which
-recomposes the scene while leaving everything else on the stage alone —
-including the Replicator render products under ``/Render``. Measured on this
-workstation: **~0.04 s** per edit, against ~0.38 s to tear down and reopen the
-stage, against a full Isaac boot (8-30 s) for the version of this file that
-called ``open_stage`` with live render products still attached and segfaulted
-every time. Render products are prims too; reopening or reloading the *root*
-layer deletes them under Hydra's feet:
+Reloading is then ``Sdf.Layer.Reload()`` on that sublayer, which leaves the
+Replicator render products alone — ~0.04 s per edit against ~0.38 s for a full
+reopen, and against the segfault that reloading the root layer causes. See
+DESIGN.md. ``--reopen`` forces the slow path.
 
-    [Error] [rtx.hydra] Invalid USD RenderProduct Prim: .../Replicator_01
-    [Error] [omni.hydra] Unable to find RP Prim from previous update pass!
-    Segmentation fault
-
-Hence: authoring cameras into the session layer, editing content in a
-sublayer, and ``Renderer.close()`` before any reopen. ``--reopen`` falls back
-to the slower full reopen for the cases a sublayer reload cannot express.
-
-WHAT ``--play`` ACTUALLY DOES
-It makes the viewer re-render continuously; it does not start physics. The
-timeline is *always* playing, because ``scene.start()`` has to play it before
-Isaac will accept joint writes at all.
-
-That used to be harmless -- the scene had gravity off and nothing was
-simulated, so a prop's authored transform WAS its rendered one. It is not
-harmless now: gravity is on (9.81) and the props are dynamic rigid bodies, so
-PhysX owns their poses and writes the simulated transform back every step.
-A layer reload changes the authored value and PhysX overwrites it, which looks
-like "I edited the position and the viewer ignored me".
-
-``reload_layers`` therefore bounces the timeline (``scene.start(restart=True)``)
-after reloading, because stopping is what resets simulated prims to their
-authored state. The arms reset with them -- unavoidable, and fine here, since
-this viewer exists for placing things rather than holding a pose.
-
-So leave ``--play`` off while you are placing things — with a static scene,
-re-rendering an identical frame only burns the GPU — and turn it on when
-something in the stage really is moving and you want to watch it.
+``--play`` makes the viewer re-render continuously; it does not start physics,
+which is always running. Leave it off while placing things.
 """
 
 from __future__ import annotations
@@ -66,10 +34,8 @@ import sys
 import time
 from pathlib import Path
 
-# How many consecutive polls a file's fingerprint must hold steady before we
-# act on it. Editors that write non-atomically (or write twice) would otherwise
-# reload against a half-written file. Two polls is enough in practice and costs
-# one poll of latency.
+# Consecutive steady polls before acting, so a non-atomic editor write cannot
+# reload a half-written file. Costs one poll of latency.
 STABLE_POLLS = 2
 
 FREE = "__free__"          # sentinel the browser sends for the free-look camera
@@ -78,18 +44,12 @@ FREE = "__free__"          # sentinel the browser sends for the free-look camera
 class LayerWatcher:
     """Fingerprints every on-disk layer the stage composes from.
 
-    Watching only the top-level scene file misses the case that actually bites:
-    ``scene.usda`` references ``yam_ultra.usda``, so editing the arm asset --
-    a joint limit, a mesh path, the wrist camera mount -- changes what renders
-    while the scene file's mtime never moves. ``Stage.GetUsedLayers()`` gives
-    the real dependency set after composition, so the watch list is rebuilt on
-    every reload rather than guessed up front.
+    Watching only the scene file would miss edits to the assets it references,
+    which change what renders without touching its mtime. The watch list comes
+    from ``Stage.GetUsedLayers()`` and is rebuilt on every reload.
 
-    Fingerprint is (mtime_ns, size) rather than mtime alone: some filesystems
-    quantise mtime to a full second, and two saves inside that window would be
-    indistinguishable. Content hashing is available via ``--hash`` for network
-    filesystems where even mtime_ns is unreliable -- VAST and NFS both lie
-    about timestamps under some configurations.
+    The fingerprint is (mtime_ns, size), since some filesystems quantise mtime
+    to a second. ``--hash`` switches to content hashing for network mounts.
     """
 
     def __init__(self, use_hash: bool = False):
@@ -123,10 +83,8 @@ class LayerWatcher:
     def changed(self) -> list[Path]:
         """Layers whose contents have settled since the last change.
 
-        Returns the changed paths rather than a bare bool so the caller can
-        reload precisely those layers instead of everything -- the difference
-        between recomposing one small scene file and re-reading the arm asset
-        and its whole payload tree.
+        Returns paths rather than a bool, so the caller can reload precisely
+        those layers instead of re-reading every payload tree.
         """
         now = self._snapshot()
         if now == self._last:
@@ -171,10 +129,8 @@ def _dispose(renderers: dict) -> None:
 
 
 def main() -> int:
-    # This is meant to be left running under tmux with its output redirected,
-    # and Python block-buffers a redirected stdout -- which silently swallowed
-    # every reload message during testing. Line buffering costs nothing here
-    # and makes the log usable while the process is still alive.
+    # Left running under tmux with output redirected, where Python would
+    # block-buffer stdout and swallow every reload message.
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, OSError):
@@ -257,9 +213,7 @@ def main() -> int:
     def authored(st) -> list[str]:
         """Cameras that came from the file, for the browser's dropdown.
 
-        The free-look camera is on the stage but is ours, not the scene's; it
-        already has its own entry, and listing it twice invites you to select
-        the copy that ignores your mouse.
+        Excludes the free-look camera, which is ours and already has an entry.
         """
         return list(authored_paths(st))
 
@@ -271,9 +225,8 @@ def main() -> int:
     def open_wrapper() -> None:
         """Anonymous root stage with the scene file as its only sublayer.
 
-        The indirection is the whole point: the scene file becomes something
-        that can be reloaded independently of the stage carrying the render
-        products, which is what makes an edit cost 0.04 s instead of a crash.
+        The indirection is the point: the scene file can then be reloaded
+        independently of the stage carrying the render products.
         """
         stage_utils.create_new_stage()
         st = stage_utils.get_current_stage()
@@ -281,11 +234,10 @@ def main() -> int:
         app.update()
 
     def author_cameras() -> None:
-        """Add the free-look camera to the SESSION layer.
+        """Add the free-look camera to the session layer.
 
-        Session-layer edits are never saved and are not part of any sublayer,
-        so this camera cannot leak into the file being edited and survives a
-        sublayer reload untouched.
+        Session-layer edits are never saved, so this cannot leak into the file
+        being edited and survives a sublayer reload untouched.
         """
         st = stage_utils.get_current_stage()
         with Usd.EditContext(st, st.GetSessionLayer()):
@@ -296,11 +248,8 @@ def main() -> int:
     def build_renderer(name: str) -> None:
         """(Re)build the single render product for the active camera.
 
-        One camera, not all of them: the previous version rendered every
-        ``UsdGeom.Camera`` on the stage into a grid, which on a fresh Kit stage
-        means four stock viewport cameras nobody asked for plus the one you
-        care about -- five render products and five frames per update. Switch
-        cameras from the browser instead.
+        One camera, not all: a fresh Kit stage carries four stock viewport
+        cameras, and rendering them all costs five frames per update.
         """
         nonlocal renderers
         _dispose(renderers)
@@ -317,10 +266,8 @@ def main() -> int:
     def load(full: bool = True) -> bool:
         """Open (or reopen) the wrapper stage and rebuild the renderer.
 
-        Guarded end to end, not just around the open: a scene that parses but
-        fails during start() -- bad physics schema, missing mesh, articulation
-        with no root -- would otherwise take the process down mid-edit and cost
-        an Isaac boot to get back.
+        Guarded end to end: a scene that parses but fails during start() would
+        otherwise take the process down mid-edit.
         """
         try:
             if full:
@@ -342,9 +289,8 @@ def main() -> int:
     def reload_layers(changed: list[Path]) -> bool:
         """Fast path: reload just the layers that changed on disk.
 
-        Falls back to a full reopen when a changed file is not actually a layer
-        of this composition -- a newly added reference, say, which the old
-        composition never saw and so cannot reload.
+        Falls back to a full reopen when a changed file is not a layer of this
+        composition — a newly added reference, say.
         """
         if args.reopen:
             return load(full=True)
@@ -358,11 +304,8 @@ def main() -> int:
             if hit != len(changed):
                 return load(full=True)      # something new appeared
             app.update()
-            # Bounce the timeline so PhysX rebuilds every rigid body from the
-            # pose the file now says. Without this the layer reload updates the
-            # authored value and the simulated one keeps being written over it,
-            # so moving a prop in the .usda does nothing on screen -- the exact
-            # symptom that shows up as "I changed x and it did not move".
+            # PhysX owns dynamic poses and overwrites the authored value, so
+            # without a bounce an edited prop position does nothing on screen.
             scene.start(app, restart=True)
             author_cameras()                # re-assert in case the file moved it
             st = stage_utils.get_current_stage()
@@ -411,9 +354,8 @@ def main() -> int:
     print("  drag to orbit, wheel to zoom, shift-drag to pan.")
     print("  edit the .usda and save — the view follows. Ctrl-C to stop.\n")
 
-    # SIGTERM as well as Ctrl-C: this gets run under tmux and killed by
-    # scripts, and skipping the finally block leaks the port and the GPU
-    # context, which then blocks the next run.
+    # SIGTERM too: run under tmux and killed by scripts, where skipping the
+    # finally block leaks the port and the GPU context.
     stopping = False
 
     def _stop(signum, frame_):
@@ -486,9 +428,7 @@ def main() -> int:
                     last_move = now
 
             # --- quality refinement once the mouse stops ----------------------
-            # Orbiting renders at drag_settle for latency, which is visibly
-            # noisier under RTX temporal sampling. When the user stops, spend
-            # the extra updates once to leave a clean image on screen.
+            # Orbiting renders at drag_settle, which RTX sampling makes noisy.
             if (not args.play and last_move and now - last_move > 0.35
                     and state["active"] == FREE):
                 last_move = 0.0
@@ -506,10 +446,8 @@ def main() -> int:
                         vp.publish(img)
                         drew = True
             elif not drew:
-                # With physics off the scene cannot change on its own, so
-                # re-rendering an identical frame just burns the GPU. The MJPEG
-                # stream holds the last published frame, so idling is free.
-                # Short sleep, not `poll`: this is also the orbit input latency.
+                # Nothing changes on its own, and the MJPEG stream holds the last
+                # frame. Short sleep: this is also the orbit input latency.
                 time.sleep(0.005)
 
     except KeyboardInterrupt:

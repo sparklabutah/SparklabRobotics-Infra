@@ -9,24 +9,14 @@ Publishing frames is one-way; the return path lets the browser drive the camera:
             scene.set_orbit_camera(stage, **cam)
             vp.publish(renderer.frame(settle=1))
 
-WHY NOT ISAAC'S WEBRTC LIVESTREAM
-It ships no browser client in this install (``omni.kit.livestream.webrtc`` has
-no HTML under it), wants a separate NVIDIA streaming app plus signal port
-49100, and carries media over UDP — which does not survive an SSH tunnel,
-because ``ssh -L`` forwards TCP only. This is one TCP port that VS Code's
-Remote-SSH forwards automatically, and the client is a browser tab.
-
-The cost is that orbiting round-trips to the workstation: every mouse move
-posts a pose and waits for a rendered frame. On a LAN that is imperceptible;
-on a slow link it feels like dragging through treacle rather than dropping
-frames. Interaction is deliberately throttled to one in-flight request so a
-slow link degrades to a lower update rate instead of building a backlog of
-stale poses.
+One TCP port, so VS Code's Remote-SSH forwards it automatically — see
+DESIGN.md for why not Isaac's WebRTC livestream. Orbiting round-trips to the
+workstation, throttled to one in-flight request, so a slow link degrades to a
+lower update rate rather than a backlog of stale poses.
 
 THE SERVER HOLDS NO CAMERA STATE. The client owns the orbit parameters and
-posts the complete set every time. A reconnecting tab restores its own view,
-a reload cannot desynchronise the two, and there is no accumulated drift from
-applying deltas.
+posts the complete set every time, so a reconnecting tab restores its own view
+and there is no drift from applying deltas.
 """
 
 from __future__ import annotations
@@ -210,10 +200,8 @@ hud.textContent = hudText();
 class Viewport:
     """MJPEG out plus a camera-pose return channel, on one port.
 
-    Thread-safe by the same shape as the teleop relay's CameraReader: the HTTP
-    threads only ever touch lock-protected slots, and the Isaac thread drains
-    them. Nothing here calls into USD — a render-thread-only API touched from
-    an HTTP handler is a crash waiting for a busy afternoon.
+    The HTTP threads only touch lock-protected slots and the Isaac thread
+    drains them. Nothing here calls into USD, which is render-thread-only.
     """
 
     def __init__(self, port: int = 8080, host: str = "127.0.0.1",
@@ -377,8 +365,7 @@ class Viewport:
     def take_camera(self) -> dict | None:
         """Newest orbit pose since the last call, or None if the user is idle.
 
-        Draining rather than peeking is what keeps the render loop from
-        spinning: no mouse movement means no work.
+        Drains rather than peeks, so no mouse movement means no work.
         """
         with self._lock:
             c, self._camera = self._camera, None

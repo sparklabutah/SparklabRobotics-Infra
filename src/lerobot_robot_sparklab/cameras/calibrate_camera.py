@@ -1,17 +1,13 @@
 """One-time RealSense exposure / white-balance / gain calibration.
 
-RealSense autoexposure hunts and flickers when the camera is read at a
-fixed frame rate (as the relay and LeRobot recording both do), so each
-camera gets its sensor settings frozen once by eye and the chosen values
-copied into ``config/cameras.yaml`` for that camera's id — both
-``relay/server.py`` (live VR view) and ``robots/yam_ultra/follower.py`` (dataset
-recording) read them from there.
+Autoexposure hunts and flickers when the camera is read at a fixed frame rate,
+so each camera's settings are frozen by eye and copied into
+``config/cameras.yaml``, which both the relay and the follower read::
 
-Usage:
     python -m lerobot_robot_sparklab.cameras.calibrate_camera --serial 323622272781
-    # tweak --exposure/--white-balance/--gain and re-run until the feed
-    # (e.g. realsense-viewer, pointed at the same serial) looks right,
-    # then paste the values into cameras.yaml.
+
+Re-run with different --exposure/--white-balance/--gain until the feed looks
+right, then paste the values into cameras.yaml.
 """
 
 from __future__ import annotations

@@ -25,10 +25,9 @@ N_ARM_DOF = 6
 
 def _place(stage, prim_path: str, position, yaw_rad: float) -> None:
     """Set a prim's world transform with explicit translate + Z-rotate ops.
-    
-    Clears any existing op order first: a freshly referenced prim may have
-    none, one, or an unexpected combination, and appending to that is how you
-    end up with a transform that silently depends on op ordering.
+
+    Clears any existing op order first: a referenced prim may have none, one,
+    or an unexpected combination, and appending gives an order-dependent result.
     """
     from pxr import Gf, UsdGeom
 
@@ -41,12 +40,9 @@ def _place(stage, prim_path: str, position, yaw_rad: float) -> None:
 def build(add_table: bool = True, gravity: bool = False):
     """Create the stage and return ``(left_arm, right_arm)`` Articulations.
 
-    ``gravity`` defaults to **off**. This scene poses arms, it does not
-    simulate them: the URDF ships no joint drive gains (the importer says so
-    outright — "Stiffness and damping not available ... actuator will be
-    created without gain parameters"), so under gravity the joints would sag
-    out of any pose written to them. Zero gravity makes a written pose stay
-    put. Turn it on only once real drive gains exist.
+    gravity: off by default. The URDF ships no joint drive gains, so under
+        gravity the joints sag out of any pose written to them. Turn it on
+        only once real drive gains exist.
     """
     import isaacsim.core.experimental.utils.stage as stage_utils
     from isaacsim.core.experimental.objects import DistantLight, GroundPlane
@@ -69,12 +65,8 @@ def build(add_table: bool = True, gravity: bool = False):
     stage_utils.add_reference_to_stage(usd, LEFT_PRIM)
     stage_utils.add_reference_to_stage(usd, RIGHT_PRIM)
 
-    # Place the *reference* prims with plain USD xform ops rather than
-    # Articulation.set_world_poses. Two reasons, both learned the hard way:
-    # the Articulation wrapper resolves to child prims (it asserts about
-    # ".../Geometry"), and the asset is imported with a fixed base, so once
-    # the timeline plays the arm is welded to the world wherever it then
-    # stands. Positioning the root before play is what actually moves it.
+    # Plain xform ops, not set_world_poses: that resolves to child prims, and
+    # the fixed-base asset welds to the world once the timeline plays.
     _place(stage, LEFT_PRIM, rig.LEFT_ARM_POSITION, rig.LEFT_ARM_YAW_RAD)
     _place(stage, RIGHT_PRIM, rig.RIGHT_ARM_POSITION, rig.RIGHT_ARM_YAW_RAD)
 
@@ -89,9 +81,8 @@ def build(add_table: bool = True, gravity: bool = False):
 def _add_table() -> None:
     """A visual slab at z=0 standing in for the table top.
 
-    Cosmetic only: the arms are bolted to it, so it carries no collision role
-    in a kinematic scene. It exists to make renders readable and to make a
-    wrong camera height obvious by eye.
+    Cosmetic only — no collision role in a kinematic scene. It makes renders
+    readable and a wrong camera height obvious by eye.
     """
     from isaacsim.core.experimental.objects import Cube
 
@@ -136,21 +127,8 @@ def start(app, warmup_frames: int = 5, restart: bool = False) -> None:
 FINGER_TRAVEL = -0.04695
 
 
-# PD gains per DOF, in the joint order the articulation reports:
-#   joint1..joint6, left_finger, right_finger
-#
-# Taken from yamlab (ARISE-Initiative/yamlab, MIT), configs/robot/yam.yaml
-# `controller.high_pd` -- the gain set it drives the same YAM arm with in sim:
-#   shoulder joint1-3   800 / 50
-#   elbow    joint4     800 / 50
-#   wrist    joint5-6    30 /  5
-#   gripper  fingers   2000 / 100
-#
-# THESE ARE PER RADIAN, which is why they are applied here in code and not
-# authored into the USD. UsdPhysics angular drive stiffness is per DEGREE, so
-# writing 800 into a USD drive would be 57.3x too stiff and the arm would go
-# unstable on the first step. yamlab's own USD ships zeros for the same reason
-# and sets gains through the tensor API, exactly as below.
+# PD gains per DOF, from yamlab's `controller.high_pd`. PER RADIAN, hence the
+# tensor API rather than USD drives, which are per DEGREE.
 DRIVE_STIFFNESS = np.array([800.0, 800.0, 800.0, 800.0, 30.0, 30.0, 2000.0, 2000.0])
 DRIVE_DAMPING = np.array([50.0, 50.0, 50.0, 50.0, 5.0, 5.0, 100.0, 100.0])
 
@@ -158,9 +136,8 @@ DRIVE_DAMPING = np.array([50.0, 50.0, 50.0, 50.0, 5.0, 5.0, 100.0, 100.0])
 def set_drive_gains(arm, stiffness=None, damping=None) -> None:
     """Give an arm's joints PD gains so drive targets actually hold.
 
-    Without this every gain is 0 (the URDF ships none and the importer says so
-    outright), so a position target exerts no force at all and the arm simply
-    does not move under ``drive()``. Call once per arm after ``start()``.
+    Without this every gain is 0, so a position target exerts no force and the
+    arm does not move under ``drive()``. Call once per arm after ``start()``.
     """
     k = DRIVE_STIFFNESS if stiffness is None else np.asarray(stiffness, dtype=float)
     d = DRIVE_DAMPING if damping is None else np.asarray(damping, dtype=float)
@@ -176,39 +153,31 @@ def _targets(q_arm, gripper: float):
 
 
 def pose(arm, q_arm, gripper: float = 0.0) -> None:
-    """Set one arm's joint positions directly. ``q_arm`` is 6 radians.
+    """Set one arm's joint positions directly, a kinematic write.
 
-    Kinematic write, not a drive target: the pose appears on the next render
-    whether or not physics is stepped. ``gripper`` is 0..1 normalised, mapped
-    onto both prismatic finger joints.
+    Teleports the joint state, so the fingers pass through objects rather than
+    pushing them. Use :func:`drive` to interact with anything.
 
-    This teleports the joint state, so the fingers pass THROUGH objects
-    instead of pushing them -- a kinematic finger builds no contact force and
-    cannot hold a grasp. Use it for posing and rendering; use :func:`drive`
-    when you want the arm to interact with anything.
+    q_arm: 6 joint angles in radians.
+    gripper: 0..1 normalised, mapped onto both prismatic finger joints.
     """
     arm.set_dof_positions([_targets(q_arm, gripper)])
 
 
 def drive(arm, q_arm, gripper: float = 0.0) -> None:
-    """Command one arm's joints as PD drive targets. ``q_arm`` is 6 radians.
+    """Command one arm's joints as PD drive targets.
 
-    Unlike :func:`pose` this does not teleport: the joints are pulled toward
-    the target by the drives, so contact forces build, objects get pushed, and
-    a closing gripper can actually hold something. It also means the arm LAGS
-    the target and may never fully reach it -- which is the behaviour real
-    hardware has, and the reason to prefer this when the sim is standing in
-    for the robot.
+    Unlike :func:`pose` the joints are pulled toward the target, so contact
+    builds and a gripper can hold — and the arm lags, as hardware does.
+    Requires :func:`set_drive_gains`, or nothing moves.
 
-    Requires :func:`set_drive_gains` to have been called, or nothing moves.
+    q_arm: 6 joint angles in radians.
     """
     arm.set_dof_position_targets([_targets(q_arm, gripper)])
 
 
-# The importer nests the kinematic chain under a "Geometry" scope, so link
-# paths are NOT <arm>/base/link1/... as the URDF's link names alone suggest.
-# Kept here rather than spelled out at call sites: it is a property of how the
-# converter lays out the USD, and it changed once already.
+# The importer nests the chain under a "Geometry" scope, so link paths are not
+# <arm>/base/link1/... as the URDF's names suggest. A property of the converter.
 _LINK_CHAIN = ["base", "link1", "link2", "link3", "link4", "link5", "gripper"]
 
 
@@ -237,8 +206,7 @@ def add_top_camera(resolution=(640, 360)):
     """The D435F third-person camera, centred between the arms.
 
     Lateral placement is measured; height and pitch are not — see ``rig``.
-    Resolution defaults to the dataset's 640x360 so rendered frames are
-    directly comparable to recorded ones.
+    Resolution defaults to the dataset's, so frames compare to recorded ones.
     """
     import isaacsim.core.experimental.utils.stage as stage_utils
     from pxr import Gf, UsdGeom
@@ -250,9 +218,8 @@ def add_top_camera(resolution=(640, 360)):
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(
         -rig.TOP_CAMERA_STANDOFF_M, rig.TOP_CAMERA_Y, rig.TOP_CAMERA_HEIGHT_M))
-    # A USD camera looks down its local -Z with +Y up. RotateX(+90) swings
-    # that to look along world +Y; RotateZ(-90) then swings it to world +X,
-    # the direction the arms reach. The pitch rides on the X term.
+    # A USD camera looks down local -Z with +Y up; RotateX(+90) then
+    # RotateZ(-90) swings it to world +X, where the arms reach.
     xform.AddRotateZOp().Set(-90.0)
     xform.AddRotateXOp().Set(float(90.0 + np.rad2deg(rig.TOP_CAMERA_PITCH_RAD)))
 
@@ -263,11 +230,10 @@ def add_top_camera(resolution=(640, 360)):
 def add_overview_camera(prim_path: str = OVERVIEW_PRIM, standoff: float = 2.2,
                         height: float = 1.6, pitch_deg: float = -35.0,
                         yaw_deg: float = -35.0, focal_mm: float = 15.0):
-    """A wide 3/4 view of the whole workspace, for authoring rather than data.
+    """A wide 3/4 view of the workspace, for authoring rather than data.
 
-    Not part of the rig — it exists so you can see what you are moving. Added
-    in memory by the live viewer after each reload, so it never pollutes the
-    scene file you are editing.
+    Not part of the rig. Added in memory by the live viewer after each reload,
+    so it never pollutes the scene file you are editing.
     """
     import isaacsim.core.experimental.utils.stage as stage_utils
     from pxr import Gf, UsdGeom
@@ -288,12 +254,9 @@ def add_overview_camera(prim_path: str = OVERVIEW_PRIM, standoff: float = 2.2,
 def export_usd(path, add_table: bool = True) -> str:
     """Build the scene and save it as an editable ``.usda``.
 
-    ``.usda`` is ASCII, so the exported file can be edited in any text editor —
-    move a prim by changing its ``xformOp:translate`` — which is the point:
-    ``sparklab_sim.live`` watches this file and re-renders on save.
-
-    Regenerating overwrites hand edits. The generated file is a *starting
-    point* you then own; keep it out of the build step once you start editing.
+    ASCII, so a prim can be moved in any text editor; ``sparklab_sim.live``
+    watches the file and re-renders on save. Regenerating overwrites hand
+    edits — the output is a starting point you then own.
     """
     import isaacsim.core.experimental.utils.stage as stage_utils
 
@@ -310,15 +273,11 @@ def export_usd(path, add_table: bool = True) -> str:
 def cameras(stage, include_viewport: bool = False) -> dict:
     """Every ``UsdGeom.Camera`` in the stage, as ``{short_name: prim_path}``.
 
-    Discovered rather than hardcoded, so a camera you add by hand to the USD
-    shows up in the live view without touching this code.
+    Discovered rather than hardcoded, so a camera added by hand to the USD
+    shows up in the live view.
 
-    Kit seeds every stage with four viewport cameras — ``OmniverseKit_Persp``,
-    ``_Front``, ``_Top``, ``_Right`` — which are UI furniture, not part of the
-    rig. They are excluded by default: rendering them cost the live viewer
-    five render products and five frames per update where one was wanted, and
-    buried the camera being tuned in a grid of stock orthographic views. Pass
-    ``include_viewport=True`` if you actually want them.
+    include_viewport: also return Kit's four stock viewport cameras, which are
+        UI furniture and would otherwise cost a render product each.
     """
     from pxr import Usd, UsdGeom
 
@@ -337,12 +296,8 @@ def cameras(stage, include_viewport: bool = False) -> dict:
 # it never reaches the .usda being edited.
 FREE_PRIM = "/World/FreeCamera"
 
-# Opening view for the live viewer, framed on the workspace rather than the
-# origin: the arms sit at z=0 either side of y=0 and reach along +X, so a
-# target at the origin puts everything worth looking at in the bottom of the
-# frame. Derived from rig.py so it tracks the measurements rather than
-# repeating them -- the browser fetches this from /info instead of carrying
-# its own copy.
+# Framed on the workspace, not the origin. Derived from rig.py so it tracks
+# the measurements; the browser fetches it from /info.
 HOME_VIEW = {
     "target": (0.15, 0.0, 0.25),
     "distance": 1.8,
@@ -358,22 +313,15 @@ def set_orbit_camera(stage, prim_path: str = FREE_PRIM,
                      azimuth_deg: float = HOME_VIEW["azimuth_deg"],
                      elevation_deg: float = HOME_VIEW["elevation_deg"],
                      focal_mm: float = HOME_VIEW["focal_mm"]):
-    """Point a camera at *target* from a spherical offset. Creates it if absent.
+    """Point a camera at *target* from a spherical offset, creating it if absent.
 
-    This is the free-look camera the browser viewport drives: the client owns
-    the orbit state and posts it here on every mouse move, so the whole thing
-    is stateless on this side — no accumulated drift, and a reconnecting client
-    can restore its view exactly by replaying its own numbers.
+    The free-look camera the browser drives. Stateless on this side: the client
+    owns the orbit state and posts it on every mouse move, so there is no drift
+    and a reconnecting client restores its view by replaying its own numbers.
 
-    Angles are in the world frame with **+Z up**: ``azimuth_deg`` rotates in
-    the XY plane from +X, ``elevation_deg`` lifts off it. Elevation is clamped
-    just shy of the poles because a view direction parallel to the up vector
-    makes the look-at basis singular and the camera flips.
-
-    Written as one ``xformOp:transform`` rather than translate+rotate ops: an
-    arbitrary look-at is not expressible as the Z-then-X rotation pair the rig
-    cameras use, and mixing the two conventions on one prim is how you get
-    "Unable to add xform op of type TypeTransform" at runtime.
+    azimuth_deg: rotation in the XY plane from +X, world frame, +Z up.
+    elevation_deg: lift off that plane, clamped shy of the poles where the
+        look-at basis goes singular.
     """
     from pxr import Gf, UsdGeom
 
@@ -407,15 +355,9 @@ def set_camera(stage, standoff=None, height=None, pitch_deg=None,
                focal_mm=None, y=None) -> dict:
     """Move the existing top camera in place. Returns the applied values.
 
-    This is the knob for interactive tuning: it mutates the camera prim rather
-    than rebuilding the stage, so a warm kernel can iterate in seconds instead
-    of paying Isaac's ~15 s boot per try. Omitted arguments keep their current
-    value, so you can nudge one axis at a time — which is the only sane way to
-    fit a 6-DOF pose by eye.
-
-    Whatever converges here should be written back into ``rig.py`` and flipped
-    from ASSUMED to MEASURED; values that live only in a notebook cell are
-    values you will lose.
+    Mutates the prim rather than rebuilding the stage, so a warm kernel
+    iterates in seconds. Omitted arguments keep their current value, so you can
+    nudge one axis at a time. Write whatever converges back into ``rig.py``.
     """
     from pxr import Gf, UsdGeom
 

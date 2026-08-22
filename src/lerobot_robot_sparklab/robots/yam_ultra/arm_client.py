@@ -1,31 +1,13 @@
 """Client for one ``arm_server`` process, shaped like an i2rt robot.
 
 One per arm, held by ``YamUltraFollower``; the only thing in the LeRobot
-process that talks to the motors. See ``arm_server`` for why the split exists.
+process that talks to the motors. Duck-types the subset of ``MotorChainRobot``
+the follower calls, so moving the arms out of process left its logic untouched.
 
-It duck-types the subset of ``MotorChainRobot`` the follower actually calls —
-``num_dofs()`` / ``get_joint_pos()`` / ``command_joint_pos()`` / ``close()`` —
-so moving the arms out of process left the follower's logic (Δq clamp,
-park-on-disconnect, dead-loop detection, gripper flip, cameras) untouched.
-
-TWO CALLING STYLES:
-
-  blocking      ``get_joint_pos()`` / ``command_joint_pos()`` — one round trip,
-                for park and anything off the hot path.
-
-  async/paired  ``read_async()`` / ``command_clamped_async()`` return portal
-                futures collected later with ``collect()``, so the follower can
-                start BOTH arms' calls before waiting on either. Otherwise left
-                and right pay their round trips back to back.
-
-  ``command_clamped_async`` also folds read+clamp+command into one call, which
-  halves round trips and removes the window where the arm could move between.
-
-Liveness is the one addition. i2rt exposes it as ``motor_chain.running``; over
-RPC that would be a round trip per ``is_connected`` poll, so every response
-carries the flag and ``is_alive()`` returns the cached value. A dead chain is
-exactly the case you cannot query separately — ``get_joint_pos()`` keeps
-returning the last pose it read.
+Two calling styles: blocking ``get_joint_pos()`` / ``command_joint_pos()`` for
+anything off the hot path, and ``read_async()`` / ``command_clamped_async()``
+returning portal futures, so a bimanual caller can start both arms before
+waiting on either. Liveness rides back on every response — see DESIGN.md.
 """
 
 from __future__ import annotations
@@ -42,12 +24,11 @@ logger = logging.getLogger(__name__)
 _CALL_TIMEOUT_S = 30.0
 
 class ArmServerUnreachable(RuntimeError):
-    """Raised when no ``arm_server`` is listening — almost always "the
-    servers were not started", so the message says how to start them."""
+    """Raised when no ``arm_server`` is listening; the message says how to start one."""
 
 
 class YamArmClient:
-    """One arm, over portal RPC. See the module docstring."""
+    """One arm, over portal RPC."""
 
     def __init__(self, host: str, port: int, connect_timeout_s: float = 10.0,
                  expect_sim: bool | None = None,
@@ -90,9 +71,8 @@ class YamArmClient:
     def _await_listener(host: str, port: int, timeout_s: float) -> None:
         """Block until something accepts TCP on host:port, or raise.
 
-        Retries rather than probing once, because the follower's `sim` mode
-        spawns its servers moments before connecting and they take ~1 s to
-        come up.
+        Retries rather than probing once: the follower's sim mode spawns its
+        servers moments before connecting and they take ~1 s to come up.
         """
         deadline = time.monotonic() + timeout_s
         last_err: OSError | None = None
@@ -131,20 +111,20 @@ class YamArmClient:
 
     # ---- combined read+clamp+command (one round trip) -----------------
     def read_async(self):
-        """Issue a read; returns the future. Lets a bimanual caller overlap
-        both arms instead of paying two round trips back to back."""
+        """Issue a read and return the future, so a caller can overlap both arms."""
         return self._client.call("read", {})
 
     def command_clamped_async(self, target: np.ndarray, caps: np.ndarray | None,
                               n_arm: int):
-        """Issue read+clamp+command as ONE call; returns the future.
+        """Issue read+clamp+command as one call; returns the future.
 
-        Halves the follower's RPC rate, which matters more than it sounds:
-        portal's client socket burns ~97% of a core at 20 calls/s and ~12%
-        idle (measured), on a thread that holds the GIL — so RPCs removed are
-        control-loop headroom returned. Also removes the gap between reading
-        `present` and commanding, during which the arm used to be free to
-        move out from under the clamp.
+        Halves the follower's RPC rate, and removes the gap between reading
+        `present` and commanding during which the arm could move out from
+        under the clamp.
+
+        target: absolute joint positions.
+        caps: per-joint Δq allowance, or None to skip clamping.
+        n_arm: how many leading joints the caps apply to.
         """
         payload = {"target": np.asarray(target, dtype=np.float64),
                    "n_arm": np.int64(n_arm)}
@@ -162,10 +142,8 @@ class YamArmClient:
     def close(self) -> None:
         """Drop the RPC connection only.
 
-        Does NOT stop the server: it is a separate, externally managed
-        process that owns torque and its own park-on-exit, and other clients
-        (or a later run) may still want it. The follower parks through this
-        client *before* calling close, exactly as it did in-process.
+        Does not stop the server: it owns torque and its own park-on-exit, and
+        other clients may still want it. The follower parks before calling this.
         """
         try:
             self._client.close()
@@ -174,21 +152,19 @@ class YamArmClient:
 
     # ---- liveness -----------------------------------------------------
     def is_alive(self) -> bool:
-        """Cached — refreshed by every read/command. See module docstring."""
+        """Cached; refreshed by every read/command."""
         return self._alive
 
     def park_async(self, duration_s: float = 5.0):
-        """Start the server-side ramp home; returns the portal future.
+        """Start the server-side ramp home and return the portal future.
 
-        Separate from ``park`` so a bimanual caller can start BOTH arms
-        before waiting on either — the ramp blocks for ``duration_s``
-        server-side, so waiting on one before starting the other would move
-        the arms one at a time instead of together.
+        Separate from ``park`` because the ramp blocks server-side, so a
+        bimanual caller must start both arms before awaiting either.
         """
         return self._client.call("park", {"duration_s": np.float64(duration_s)})
 
     def park(self, duration_s: float = 5.0) -> bool:
-        """Ramp home and wait. See ``park_async`` for the bimanual case."""
+        """Ramp home and wait. Returns whether the server reported success."""
         out = self.park_async(duration_s).result(timeout=duration_s + _CALL_TIMEOUT_S)
         return bool(out["ok"])
 

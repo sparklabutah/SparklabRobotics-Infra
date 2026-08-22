@@ -1,14 +1,10 @@
-"""One-off: push each camera's RealSense advanced-mode JSON preset (from
-config/cameras.yaml's ``advanced_json`` field) onto the hardware.
+"""Push each camera's RealSense advanced-mode JSON preset onto the hardware.
 
-Run this once per power-up, before starting the relay or lerobot-record:
+Reads ``advanced_json`` from config/cameras.yaml. Run once per power-up, before
+the relay or lerobot-record — the settings persist in the device's own memory
+until it loses power::
 
     python -m lerobot_robot_sparklab.cameras.apply_camera_presets
-
-The settings (fixed exposure/white-balance/color-correction, etc.) live in
-the device's own memory once loaded — they stick until the camera loses
-power or is told otherwise, so later relay/lerobot-record runs just see an
-already-locked camera and don't need to reapply anything.
 """
 
 from __future__ import annotations

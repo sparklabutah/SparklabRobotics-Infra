@@ -2,22 +2,13 @@
 
     ./scripts/isaac_python.sh -m sparklab_sim.capture
 
-Serves a page with a Capture button. Each click renders a high-quality
-workspace overview plus the three rig cameras at their real resolutions and
-fields of view, then shows them. Nothing renders between clicks.
+Each click renders a high-quality workspace overview plus the three rig cameras
+at their real resolutions and fields of view. Nothing renders between clicks,
+so idle costs nothing and each capture can afford enough settle frames to be
+clean — unlike a live stream, which must stay responsive.
 
-WHY ON DEMAND RATHER THAN A LIVE STREAM
-Continuous rendering burns the GPU producing frames nobody looks at — while
-you are editing a USD in another window, every frame is wasted. It also forces
-a low ``settle`` count to stay responsive, so the images you *do* look at are
-the noisy ones. Rendering only on request inverts both: idle costs nothing,
-and each capture can afford enough settle frames to be genuinely clean.
-
-THREADING
-Isaac's ``app.update()`` must run on the main thread. The HTTP handler
-therefore does not render — it sets a request flag and waits. The main loop
-polls that flag, renders, publishes, and signals completion. Rendering from
-the server thread would race Kit's update loop and eventually crash.
+``app.update()`` must run on the main thread, so the HTTP handler sets a
+request flag and waits while the main loop renders and signals completion.
 """
 
 from __future__ import annotations

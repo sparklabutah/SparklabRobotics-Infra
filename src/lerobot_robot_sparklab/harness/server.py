@@ -1,47 +1,27 @@
 """Web harness: put a high-level agent in front of the low-level VLA.
 
     sparklab-harness --rollout http://127.0.0.1:8090 --agent scripted
-    sparklab-harness --agent gemini            # needs HARNESS_MODEL + GOOGLE_API_KEY
+    sparklab-harness --agent gemini   # needs HARNESS_MODEL + GOOGLE_API_KEY
 
 then open http://127.0.0.1:8099/ .
 
-WHERE THIS SITS. It does not own the robot and never will::
+This does not own the robot. It serves the UI, runs the agent loop, and proxies
+control to a separate ``rollout_live`` process that owns the cameras, arms and
+policy. The agent loop only ever sets a task; the human keeps pause and reset.
+See DESIGN.md for the process split.
 
-    rollout_live process  (owns cameras, arms, the policy)
-      :8090  GET /status  GET /observation  GET /frame/<cam>.jpg  POST /cmd
-        ^
-        | HTTP
-    harness server (this file)     :8099
-        |  serves the UI, runs the agent loop, proxies control
-        v
-    browser  +  high-level agent (in-process, or any external caller)
+The built-in loop is a convenience, not the interface — anything that speaks
+HTTP can be the planner::
 
-Two processes on purpose. The rollout holds a ~21 GB model and a live control
-loop; restarting it costs ~90 s. Editing a prompt, swapping agents or reloading
-the UI must not imply restarting that. It also means a crash in this file
-cannot take the arms down — the worst case is the robot continuing on its last
-instruction, which is why the loop only ever sets a task and the human keeps
-pause and reset.
-
-DRIVING IT FROM AN EXTERNAL AGENT. The built-in loop is a convenience, not the
-interface. Anything that can speak HTTP can be the planner:
-
-    curl -s :8099/api/state                      # frames available, task, ticks
-    curl -s :8099/api/frame/top     -o top.jpg   # what the robot sees
+    curl -s :8099/api/state                     # frames available, task, ticks
+    curl -s :8099/api/frame/top    -o top.jpg   # what the robot sees
     curl -s :8099/api/task -d '{"task":"pick up the scissors"}'
 
-Run with --agent none and the harness is exactly that: a UI plus a REST facade
-over the rollout, with nothing deciding on its own.
+With --agent none the harness is just that facade, deciding nothing.
 """
 
-# NO `from __future__ import annotations` in this file, deliberately. FastAPI
-# resolves route annotations with get_type_hints(), which looks them up in the
-# MODULE namespace -- but `Request` is imported inside build_app(). Under PEP 563
-# the annotation is the string "Request", resolution fails, and FastAPI silently
-# demotes the parameter to a query arg: every POST then 422s with
-# {"loc":["query","req"],"msg":"Field required"} instead of reading the body.
-# Without the future import the annotation is evaluated at def time, where
-# `Request` is in scope.
+# NO `from __future__ import annotations` here: FastAPI resolves route
+# annotations in the module namespace, and under PEP 563 every POST 422s.
 
 import argparse
 import json
@@ -71,10 +51,8 @@ class Harness:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_error: str | None = None
-        # Bumped on every stop. An agent turn takes a second or two (a model
-        # call), and a task decided BEFORE the operator hit stop must not be
-        # applied AFTER it -- that is a reset being silently undone by a
-        # decision already in flight. step_once() compares this across the call.
+        # Bumped on every stop, and compared across a turn by step_once(): a
+        # task decided before the operator hit stop must not be applied after.
         self._epoch = 0
 
     def stop_agent(self) -> None:
@@ -157,14 +135,12 @@ class Harness:
 
         applied = None
         if decision.task and self._epoch != epoch:
-            # Stopped (or reset) while this turn was thinking. Dropping the task
-            # is the whole point: applying it would drive the arms off the home
-            # pose the operator just asked for.
+            # Stopped or reset mid-turn: applying the task would drive the arms
+            # off the home pose the operator just asked for.
             applied = {"skipped": "agent was stopped during this turn"}
         elif decision.task:
-            # The one thing the agent is allowed to do. retarget() clears the
-            # policy's queued chunk, so the change takes effect on the next
-            # tick rather than after up to 30 stale actions.
+            # The one thing the agent may do. retarget() clears the queued
+            # chunk, so it lands next tick instead of after 30 stale actions.
             applied = self.post_cmd("task", decision.task)
         if decision.done:
             self.stop_agent()
@@ -183,9 +159,8 @@ class Harness:
                 logger.exception("agent loop")
                 self.last_error = f"{type(e).__name__}: {e}"
                 self.emit("error", error=self.last_error)
-                # Keep looping. Stopping here would leave the robot executing
-                # its last instruction with nothing watching, which is worse
-                # than a noisy retry the operator can see and act on.
+                # Stopping would leave the robot on its last instruction with
+                # nothing watching — worse than a retry the operator can see.
 
     def start_thread(self) -> None:
         if self._thread:
@@ -232,12 +207,10 @@ def build_app(h: Harness):
                         headers={"Cache-Control": "no-store"})
 
     def _unreachable(e: Exception) -> JSONResponse:
-        """A down rollout is the normal case while it does its ~90 s model load.
+        """Report a down rollout as such, which is normal during its model load.
 
-        Without this the urllib error escapes as a bare 500 "Internal Server
-        Error" with no JSON body, and the UI can only report "HTTP 500" — which
-        reads like a harness bug rather than "the thing you are driving is not
-        up yet".
+        Without this the urllib error escapes as a bare 500 with no JSON body,
+        and the UI can only say "HTTP 500" — which reads like a harness bug.
         """
         return JSONResponse(
             {"error": f"cannot reach rollout at {h.rollout}: {e}"}, status_code=502)
@@ -260,10 +233,8 @@ def build_app(h: Harness):
         body = await req.json()
         h.goal = (body.get("goal") or "").strip()
         h.history.clear()
-        # Reset the agent too, not just the transcript. Clearing history alone
-        # left a stateful agent mid-plan: it reported the OLD goal finished, so
-        # Start armed the loop and the first turn immediately disarmed it.
-        # Optional on the agent -- a stateless one needs nothing.
+        # Not just the transcript: clearing history alone left a stateful agent
+        # mid-plan, reporting the old goal finished. Optional on the agent.
         reset = getattr(h.agent, "reset", None)
         if callable(reset):
             reset()
@@ -276,15 +247,13 @@ def build_app(h: Harness):
     async def cmd(req: Request):
         body = await req.json()
         c = (body.get("cmd") or "").strip().lower()
-        # pause/resume/reset/park/home stay operator-only; the agent loop never
-        # reaches this route. "quit" is excluded on purpose -- killing the
-        # rollout from a web button is a footgun, and it owns the arms.
+        # Operator-only; the agent loop never reaches this route. "quit" is
+        # excluded on purpose — it owns the arms.
         if c not in {"pause", "resume", "reset", "park", "home"}:
             return JSONResponse({"error": f"{c!r} not allowed here"}, status_code=400)
         if c in {"pause", "reset"}:
-            # Stop the agent too. A reset that leaves the loop running is undone
-            # within one interval, when the next decision retargets the policy —
-            # the arms ramp home and then immediately drive off again.
+            # A reset that leaves the loop running is undone within one interval:
+            # the arms ramp home, then the next decision drives them off again.
             h.stop_agent()
         try:
             return h.post_cmd(c, body.get("arg"))

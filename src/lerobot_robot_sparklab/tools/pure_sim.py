@@ -1,23 +1,14 @@
 """Pure-simulation VR teleop — no hardware follower.
 
 Runs `BiQuestTeleoperator` against the Quest pose stream and publishes
-`ik_state` back to the relay instead of commanding motors. Same IK pipeline
-as `robots/yam_ultra/teleop_bimanual.py` minus the YamUltraFollower / CAN
-handling — useful for testing IK behavior without the physical robot
-powered up.
+`ik_state` back to the relay instead of commanding motors. The same IK pipeline
+as `teleop_bimanual.py`, minus the follower and CAN handling::
 
-Quick test workflow (no robot needed):
-  1. Relay server up:        sparklab-relay
-     (USB via `adb reverse` or LAN HTTPS — see the README)
-  2. This pure-sim loop:     python -m lerobot_robot_sparklab.tools.pure_sim
-  3. Quest browser → http://localhost:8443/ (USB) or
-     https://<workstation-lan-ip>:8443/ (LAN) → Start Teleop →
-     squeeze a grip.
+    sparklab-relay                                    # 1. relay
+    python -m lerobot_robot_sparklab.tools.pure_sim   # 2. this loop
+    # 3. Quest browser -> the relay page -> Start Teleop -> squeeze a grip
 
-`ik_state` carries both arms (`left_qpos` / `right_qpos`) for the Quest UI. To
-watch it on the workstation, use the Isaac viewport:
-
-    ./scripts/isaac_python.sh -m sparklab_sim.live
+To watch it on the workstation: ./scripts/isaac_python.sh -m sparklab_sim.live
 """
 
 from __future__ import annotations
