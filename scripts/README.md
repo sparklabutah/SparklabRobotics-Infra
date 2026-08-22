@@ -1,4 +1,4 @@
-# scripts/
+# scripts
 
 Every command below is copy-pasteable from the repo root.
 
@@ -9,13 +9,13 @@ they work from any directory:
 
 **Python scripts** are not executable, deliberately — each needs a specific
 interpreter, and a bare `./script.py` would pick up whatever `python3` is first
-on `PATH`, which has no torch. There is one invocation for all of them:
+on `PATH`. There is one invocation for all of them:
 
     PY="PYTHONPATH=src /opt/miniforge/envs/robot-py312/bin/python"
 
-`robot-py312` is the env with **lerobot 0.6.0**, which is what `molmoact2` and
-`pi05` need. The `robot` and `teleop` envs are on 0.4.4 and cannot load these
-checkpoints — that mismatch is the most common cause of a confusing failure here.
+`robot-py312` is the env with **lerobot 0.6.0**, which `molmoact2` and `pi05`
+need. The `robot` and `teleop` envs are on 0.4.4 and cannot load these
+checkpoints.
 
 ---
 
@@ -61,29 +61,27 @@ Ports and CAN channels are overridable:
 
 Unrecognised flags pass through to `lerobot-rollout`, so
 `--duration=120 --policy.num_flow_timesteps=4` works with no edit. `rollout.sh`
-checks that the arm servers / sim server / relay it needs are actually listening
-and names whichever is missing, instead of timing out inside `connect()`.
+checks that the arm servers / sim server / relay it needs are listening and
+names whichever is missing, instead of timing out inside `connect()`.
 
 It is one self-contained file — robot, policy, strategy and runner are four
-blocks you can read top to bottom. Change rollout behaviour there.
+blocks you can read top to bottom.
 
 Sim rollouts need the Isaac server up first, in its own terminal:
 
     ./scripts/isaac_python.sh -m sparklab_sim.policy_server --port 8081
 
-Add `--physics` to that for anything involving **contact**. Without it the
-fingers teleport and cannot hold an object, so every grasp fails regardless of
-the policy. It is left running between rollouts on purpose (Isaac costs ~15 s
-to boot) and parks the arms on its own after 45 s idle.
+Add `--physics` for anything involving **contact**. Without it the fingers
+teleport and cannot hold an object, so every grasp fails regardless of the
+policy. Leave it running between rollouts — Isaac costs ~15 s to boot — and it
+parks the arms on its own after 45 s idle.
 
 Running two rollouts at once? Foxglove aborts on a bound port rather than
 falling back, so move both:
 
     FOXGLOVE_PORT=8766 CONTROL_PORT=8091 ./scripts/rollout.sh --robot=sim --mode=live
 
-**Driving a live rollout** (`--mode=live`, on hardware or sim) from a second
-pane — retargeting clears the policy's queued chunk, so a new instruction lands
-on the next tick rather than after up to 30 stale actions:
+**Driving a live rollout** from a second pane:
 
     sparklab-rollout-ctl
 
@@ -91,30 +89,19 @@ on the next tick rather than after up to 30 stale actions:
     rollout> reset                    # ramp home, clear the action queue
     rollout> park / pause / resume / status
 
-Or drive it from a browser and a high-level agent — see
-[`../src/lerobot_robot_sparklab/harness/README.md`](../src/lerobot_robot_sparklab/harness/README.md):
+Or from a browser with a high-level agent — see
+[`harness/README.md`](../src/lerobot_robot_sparklab/harness/README.md):
 
     ./scripts/rollout.sh --mode=live      # terminal 2
     ./scripts/harness.sh                  # terminal 3 -> http://127.0.0.1:8099
 
-### Two things that will cost you an afternoon
-
-**Do not re-specify a checkpoint's inference config.** A `--policy.path` load
-already carries dtype, chunking, cuda graphs and amp in its `config.json`, and
-`rollout.sh` deliberately adds nothing to it. Forcing `--policy.use_amp=true`
-onto a checkpoint that says `use_amp: false` wraps a bfloat16 model in fp16
-autocast (that flag *is* `torch.autocast(device_type="cuda")`, which defaults
-to float16) — slower, and worse actions. Only `--policy=stock-typed` spells the
-config out, because `--policy.type` infers nothing.
-
-**A slow loop is a slow arm.** One tick consumes one action from a 30 fps
-trajectory, so missing the fps target plays it in slow motion. If the arm feels
-sluggish, look for `loop running slower than target` and try:
+If the arm feels sluggish, look for `loop running slower than target` and try:
 
     CPU_CORES= ./scripts/rollout.sh --mode=live --no-foxglove
 
-`--display_data` logs three camera images every tick, and the default
-`taskset -c 0-5` reserves 6 of 24 cores.
+`--display_data` logs three camera images every tick, and `CPU_CORES` reserves
+cores. Why both matter, and why a `--policy.path` load takes no inference flags
+from a script, are in [`DESIGN.md`](../DESIGN.md#measured-constraints).
 
 ## …work out why a policy is behaving badly
 
@@ -134,7 +121,7 @@ measures the response against paraphrase and sampling noise.
     $PY scripts/analysis/lang_probe.py --checkpoint <ckpt>/pretrained_model --compare lerobot/MolmoAct2-BimanualYAM-LeRobot
 
 `--in-scene` restricts to objects visible in every probed frame; without it,
-naming an absent object counts as a failure when it is really correct behaviour.
+naming an absent object counts as a failure when it is correct behaviour.
 
 **3. Is it jerky?** Compares chunks from identical frames, with the human demo
 as the reference.
@@ -144,8 +131,7 @@ as the reference.
         --episodes 0 5 12 --frames 2
 
 **4. Does it lunge toward the stow pose?** Dumps whole 30-step chunks — the
-snap is invisible if you only look at step 0, because the robot executes all 30
-open-loop.
+snap is invisible at step 0, because the robot executes all 30 open-loop.
 
     $PY scripts/analysis/inspect_policy_chunks.py --checkpoint <ckpt>/pretrained_model --episode 5
 
@@ -191,12 +177,17 @@ interchangeable.
     ./scripts/install_isaac_kernel.sh            # once
     ./scripts/start_isaac_jupyter.sh
 
-Isaac ships its own Python 3.12 with **no lerobot**, which is why the sim runs
-as a separate server process the rollout talks to over HTTP.
+## …generate the relay's TLS cert
+
+    ./scripts/make_certs.sh                      # cover every local address
+    ./scripts/make_certs.sh 10.195.64.139        # ...or only the ones you name
+
+Regenerating invalidates the headset's one-time acceptance, so do not re-run it
+casually.
 
 ---
 
-# Gotchas
+# Known constraints
 
 **`--rename_map`** exists because checkpoints trained via `--policy.path`
 expect `top/left/right` while the dataset records `top/left_wrist/right_wrist`.
