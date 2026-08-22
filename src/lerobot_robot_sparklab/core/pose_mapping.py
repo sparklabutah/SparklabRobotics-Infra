@@ -1,22 +1,12 @@
 """Clutch-relative pose mapping: WebXR controller pose -> EE target in arm base.
 
-`ClutchPoseMapper` holds the "engage" state — the controller pose and the
-EE pose captured at the moment the operator pressed grip. While the
-clutch is held, the EE target is the engaged EE pose composed with an
-effective controller delta, rotated from Quest world into the arm's
-base frame. In the production path the caller passes the arm's current
-EE pose into `target()`: the delta then accumulates per-tick increments
-and is reach-limited to within `rot_reach_limit` / `pos_reach_limit` of the current pose,
-with the excess absorbed (slipping clutch — see the class docstring).
-Callers that pass no EE pose get the legacy absolute delta-since-engage
-mapping.
+`ClutchPoseMapper` captures the controller and EE poses on the rising clutch
+edge. While held, the EE target is that engaged pose composed with a controller
+delta rotated into the arm base. Passing the arm's current EE pose into
+`target()` enables the absorbing reach limits; omitting it gives the legacy
+absolute delta-since-engage mapping. Disengaged, `target()` returns None.
 
-On clutch release, the mapper disengages; further calls to `target()`
-return None until the next engage. This lets the operator reposition
-their hand without moving the robot.
-
-Run sanity tests:
-    python -m lerobot_robot_sparklab.core.pose_mapping
+Sanity tests: python -m lerobot_robot_sparklab.core.pose_mapping
 """
 
 from __future__ import annotations
@@ -48,11 +38,7 @@ def mat_to_quat(R: np.ndarray) -> np.ndarray:
 
 
 def quat_pow(q: np.ndarray, k: float) -> np.ndarray:
-    """Raise a quaternion to a scalar power: keep the axis, scale the angle by k.
-    `quat_pow(q, 1) = q`, `quat_pow(q, 0) = identity`, `quat_pow(q, 0.5) = sqrt(q)`.
-    Applies `ClutchPoseMapper.scale_rotation`: on the reach-limited path to each
-    per-tick increment (a rate gain), on the legacy path to the whole
-    delta-since-engage."""
+    """Raise a quaternion to a scalar power: keep the axis, scale the angle by k."""
     w = float(q[0])
     v = np.asarray(q[1:], dtype=float)
     half_angle = float(np.arctan2(float(np.linalg.norm(v)), w))
@@ -87,49 +73,17 @@ def rotvec_to_quat(v: np.ndarray) -> np.ndarray:
 class ClutchPoseMapper:
     """One-handed clutch-relative controller→EE mapping.
 
-    Parameters:
-        R: 3x3 rotation matrix taking Quest world vectors to arm base
-            vectors (i.e. v_armbase = R @ v_quest).
-        scale: linear gain on translation (1.0 = 1:1 motion).
-        scale_rotation: gain on rotation delta (1.0 = 1:1; 0.5 halves
-            the angular response of the EE relative to the controller).
-            Useful when working near a wrist singularity — small operator
-            wrist twists otherwise propagate to large elbow corrections.
-        rotation_pivot: optional 3-vector in arm-base frame. When set,
-            controller rotation is interpreted as "rotate the EE about
-            this pivot" rather than "rotate the EE in place." Captured
-            per-engage by the caller (e.g., at engage time the teleop can
-            sample the elbow body position via FK and pass it here).
-            None = in-place rotation (legacy behavior).
-        rot_reach_limit: max angle (rad) the orientation target may run ahead
-            of the arm's CURRENT orientation. Requires the caller to pass
-            `ee_quat_armbase` into `target()`. With the reach limit active, the
-            orientation channel becomes INCREMENTAL: per-tick controller
-            rotation increments accumulate into the effective delta, and
-            anything past the reach limit is absorbed (slipping clutch). Two
-            problems this kills, both seen on hardware: a demand pressed
-            far past a joint stop / gimbal can never build up the ~180°
-            error where the shortest-way direction flips (cap-speed
-            shaking), and it can never wrap around and "snap" the wrist
-            in from the other side (350° clockwise and 10° counter-
-            clockwise are the same orientation — an absolute mapping must
-            eventually agree with that; the incremental one never has
-            to). Trade-offs: absorbed twist is gone, and with
-            scale_rotation ≠ 1 the per-increment rate gain makes curved
-            hand paths path-dependent — so hand↔EE orientation
-            correspondence drifts within an engagement; re-clutching
-            realigns. 0/None disables (legacy absolute mapping).
-        pos_reach_limit: max distance (m) the position target may run ahead of
-            the arm's CURRENT EE position. Requires `ee_pos_armbase` in
-            `target()`. Same absorbing (incremental) semantics as the
-            rotation reach limit — a mouse at the screen edge: overshoot is
-            absorbed, so reversing the hand moves the target immediately
-            instead of after retracing the overshoot. Bounds the
-            position-error magnitude that drives the arm when reaching
-            past the workspace boundary (unbounded error produced
-            cap-speed bang-bang of joints 1-3 on hardware). Absorbed
-            travel drifts hand↔EE correspondence until re-clutch.
-            0/None disables.
+    R: 3x3 taking Quest world vectors to arm base, v_armbase = R @ v_quest.
+    scale: linear gain on translation, 1.0 = 1:1.
+    scale_rotation: gain on rotation delta, 1.0 = 1:1.
+    rotation_pivot: arm-base 3-vector to rotate the EE about, or None for
+        in-place rotation. Captured per-engage by the caller.
+    rot_reach_limit: max angle (rad) the orientation target may lead the arm's
+        current orientation. Requires `ee_quat_armbase` in `target()`, and makes
+        the orientation channel incremental with the excess absorbed. 0/None
+        disables. See DESIGN.md for the absorbing-clutch semantics.
+    pos_reach_limit: max distance (m) the position target may lead the current
+        EE position. Requires `ee_pos_armbase`; same absorbing semantics.
     """
 
     R: np.ndarray = field(default_factory=lambda: np.eye(3))
@@ -147,9 +101,8 @@ class ClutchPoseMapper:
         self._ee_engage_quat: np.ndarray | None = None
         self._R_quat: np.ndarray = mat_to_quat(np.asarray(self.R, float))
         self._R_quat_conj: np.ndarray = quat_conj(self._R_quat)
-        # incremental reach-limit state: previous-tick controller pose (quest
-        # frame) and the accumulated effective deltas (arm-base frame).
-        # Reset on every engage.
+        # Incremental reach-limit state: previous-tick controller pose (Quest)
+        # and accumulated effective deltas (arm base). Reset on every engage.
         self._ctrl_prev_quat: np.ndarray | None = None
         self._ctrl_prev_pos: np.ndarray | None = None
         self._d_quat_eff: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0])
@@ -160,10 +113,11 @@ class ClutchPoseMapper:
         return self._engaged
 
     def set_R(self, R: np.ndarray) -> None:
-        """Replace the rotation used for delta mapping. Typically called per
-        engage with a yaw-corrected R so the operator can turn their body
-        between sessions and still have 'controller forward' mean 'robot
-        forward'."""
+        """Replace the rotation used for delta mapping.
+
+        Typically called per engage with a yaw-corrected R, so the operator can
+        turn their body and still have controller-forward mean robot-forward.
+        """
         self.R = np.asarray(R, dtype=float).copy()
         self._R_quat = mat_to_quat(self.R)
         self._R_quat_conj = quat_conj(self._R_quat)
@@ -177,8 +131,9 @@ class ClutchPoseMapper:
         pivot_armbase: np.ndarray | None = None,
     ) -> None:
         """Capture the engage frame. Call on the rising clutch edge.
-        If `pivot_armbase` is supplied, rotation deltas during this
-        engagement pivot around that point instead of around the EE."""
+
+        pivot_armbase: point to pivot rotation deltas about; None pivots at the EE.
+        """
         self._ctrl_engage_pos = np.array(controller_pos_quest, float, copy=True)
         self._ctrl_engage_quat = np.array(controller_quat_quest, float, copy=True)
         self._ee_engage_pos = np.array(ee_pos_armbase, float, copy=True)
@@ -204,9 +159,10 @@ class ClutchPoseMapper:
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """Compute the current EE target in arm-base frame, or None if disengaged.
 
-        `ee_pos_armbase` / `ee_quat_armbase` are the arm's CURRENT EE pose;
-        passing them enables the pos/rot reach limits (see the class docstring).
-        Without them the legacy absolute mapping applies unchanged.
+        ee_pos_armbase, ee_quat_armbase: the arm's current EE pose. Passing them
+            enables the reach limits; without them the legacy absolute mapping
+            applies unchanged.
+        Returns: (target_pos, target_quat_wxyz) or None.
         """
         if not self._engaged:
             return None
@@ -215,10 +171,8 @@ class ClutchPoseMapper:
         assert self._ee_engage_pos is not None
         assert self._ee_engage_quat is not None
 
-        # Position delta. Reach-limited path: accumulate per-tick increments
-        # (vectors commute, so increments with per-tick scale compose to
-        # exactly the absolute scaled delta until the reach limit absorbs).
-        # Legacy path: absolute delta from the engage frame.
+        # Vectors commute, so per-tick increments compose to exactly the absolute
+        # scaled delta until the reach limit absorbs.
         p_now = np.asarray(controller_pos_quest, float)
         pos_limited = ee_pos_armbase is not None and bool(self.pos_reach_limit)
         if pos_limited:
@@ -232,18 +186,8 @@ class ClutchPoseMapper:
         q_now = np.asarray(controller_quat_quest, float)
         rot_limited = ee_quat_armbase is not None and bool(self.rot_reach_limit)
         if rot_limited:
-            # Incremental path: accumulate this tick's controller rotation
-            # increment (a degree or two — never direction-ambiguous) into
-            # the effective delta. At scale_rotation=1 the increments
-            # telescope to exactly the absolute delta until the reach limit
-            # clamps. At other scales the gain applies per increment (a
-            # RATE gain, like mouse sensitivity): straight twists scale
-            # exactly, but curved hand paths are path-dependent on SO(3),
-            # so a closed hand loop can leave a residual (~23° for a 60°+
-            # 60° loop at 1.5×). That is inherent to rate-scaled rotation —
-            # the alternative, scaling the total delta, wraps at 360°/scale
-            # of raw twist and reintroduces the come-around this path
-            # exists to kill. Re-clutching realigns either way.
+            # Per-tick increments are never direction-ambiguous. At
+            # scale_rotation=1 they telescope to the absolute delta; see DESIGN.md.
             assert self._ctrl_prev_quat is not None
             if float(np.dot(q_now, self._ctrl_prev_quat)) < 0.0:
                 q_now = -q_now  # hemisphere-align: q and -q are the same rotation
@@ -256,10 +200,8 @@ class ClutchPoseMapper:
             d_quat_arm /= np.linalg.norm(d_quat_arm)
             self._d_quat_eff = d_quat_arm
         else:
-            # Legacy absolute path: rotation delta in Quest world
-            # (world-frame composition: now * engage⁻¹), conjugated by
-            # R_quat to express in arm base. Keep the incremental state
-            # fresh anyway so a live reach limit toggle doesn't see stale prev.
+            # Absolute delta (now · engage⁻¹) conjugated into arm base. The
+            # incremental state is kept fresh so a live toggle sees no stale prev.
             if self._ctrl_prev_quat is not None:
                 if float(np.dot(q_now, self._ctrl_prev_quat)) < 0.0:
                     q_now = -q_now
@@ -272,10 +214,8 @@ class ClutchPoseMapper:
         target_quat = quat_mul(d_quat_arm, self._ee_engage_quat)
 
         if rot_limited:
-            # Rotation reach limit: clamp the target to within rot_reach_limit of the
-            # arm's current orientation and ABSORB the excess into the
-            # effective delta (slipping clutch — absorbed twist does not
-            # come back when the operator reverses).
+            # Clamp to within rot_reach_limit of the current orientation and absorb
+            # the excess — absorbed twist does not return when the operator reverses.
             e = quat_to_rotvec(quat_mul(target_quat, quat_conj(np.asarray(ee_quat_armbase, float))))
             e_norm = float(np.linalg.norm(e))
             if e_norm > self.rot_reach_limit:
@@ -284,10 +224,8 @@ class ClutchPoseMapper:
                 self._d_quat_eff = quat_mul(target_quat, quat_conj(self._ee_engage_quat))
                 d_quat_arm = self._d_quat_eff
 
-        # If a pivot is set, the rotation also moves the EE in an arc
-        # around it — operator's wrist twist becomes "swing around pivot."
-        # When rotation_pivot is None, the offset term vanishes and we're
-        # back to legacy in-place rotation.
+        # With a pivot set, rotation swings the EE in an arc around it; without
+        # one the offset term vanishes and rotation is in-place.
         if self.rotation_pivot is not None:
             offset = self._ee_engage_pos - self.rotation_pivot
             rotated_offset = np.zeros(3)
@@ -296,10 +234,8 @@ class ClutchPoseMapper:
         else:
             target_pos = self._ee_engage_pos + d_pos_arm
 
-        # Position reach limit: clamp toward the current EE position and ABSORB
-        # the excess into the effective delta (mouse-at-screen-edge
-        # semantics: overshoot is gone, reversal moves the target
-        # immediately instead of after retracing the overshoot).
+        # Mouse-at-screen-edge: overshoot is absorbed, so reversal moves the
+        # target immediately instead of after retracing it.
         if pos_limited:
             ee_p = np.asarray(ee_pos_armbase, float)
             dp = target_pos - ee_p
@@ -386,9 +322,8 @@ def main() -> None:
     def _ang_deg(qa, qb):
         return float(np.degrees(np.linalg.norm(quat_to_rotvec(quat_mul(qa, quat_conj(qb))))))
 
-    # T8: rotation reach limit — twist the controller 120° in 1° increments while
-    # the arm (ee pose) stays put; the target must never run further than
-    # rot_reach_limit from the current EE orientation.
+    # T8: twist 120° in 1° increments with the arm held still; the target must
+    # never lead the current EE orientation by more than rot_reach_limit.
     m8 = ClutchPoseMapper(rot_reach_limit=0.5, pos_reach_limit=0.25)
     m8.engage(ctrl_engage_pos, ctrl_engage_quat, ee_engage_pos, ee_engage_quat)
     worst = 0.0
@@ -401,9 +336,8 @@ def main() -> None:
     print(f"T8 (rot reach limit, 120° push):     max target-vs-EE angle={worst:.1f}°  "
           f"(reach limit {np.degrees(0.5):.1f}°)  [{'ok' if ok else 'FAIL'}]")
 
-    # T9: slipping clutch — after the 120° push, reversing by just the reach limit
-    # angle brings the target back onto the EE orientation (immediate bite;
-    # the absorbed 120°-28.6° never has to be retraced).
+    # T9: after the 120° push, reversing by just the reach limit angle must
+    # bring the target back onto the EE orientation.
     back = 120.0 - np.degrees(0.5)
     _, tq = m8.target(ctrl_engage_pos,
                       rotvec_to_quat(np.array([0.0, np.radians(back), 0.0])),
@@ -412,10 +346,8 @@ def main() -> None:
     print(f"T9 (reversal bites at reach limit):  residual after backing off {np.degrees(0.5):.1f}°: "
           f"{resid:.2f}°  [{'ok' if resid < 1.0 else 'FAIL'}]")
 
-    # T10: position reach limit — mouse-at-screen-edge semantics. A 1 m push
-    # clamps to pos_reach_limit from the current EE; the overshoot is absorbed,
-    # so a 5 cm reversal moves the target back 5 cm IMMEDIATELY (no
-    # retracing the 0.75 m overshoot).
+    # T10: a 1 m push clamps to pos_reach_limit; the overshoot is absorbed, so a
+    # 5 cm reversal moves the target back 5 cm immediately.
     m10 = ClutchPoseMapper(rot_reach_limit=1.0, pos_reach_limit=0.25)
     m10.engage(ctrl_engage_pos, ctrl_engage_quat, ee_engage_pos, ee_engage_quat)
     p, _ = m10.target(ctrl_engage_pos + np.array([1.0, 0, 0]), ctrl_engage_quat,
@@ -427,11 +359,8 @@ def main() -> None:
     print(f"T10 (pos reach limit, mouse-style):  clamp@1m={'ok' if ok1 else 'FAIL'}  "
           f"reversal-bites={'ok' if ok2 else 'FAIL'}")
 
-    # T11: within the reach limit and with the EE tracking the target, the
-    # incremental path reproduces the legacy absolute mapping. Holds
-    # exactly only at scale_rotation=1: at other gains the per-increment
-    # scaling is a rate gain, path-dependent on curved hand paths (see
-    # the comment in target()).
+    # T11: within the reach limit, with the EE tracking, the incremental path
+    # reproduces the absolute mapping. Exact only at scale_rotation=1.
     m_inc = ClutchPoseMapper(rot_reach_limit=3.0, pos_reach_limit=10.0)
     m_abs = ClutchPoseMapper()
     for mm in (m_inc, m_abs):

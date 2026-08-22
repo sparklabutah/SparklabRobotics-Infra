@@ -1,32 +1,11 @@
 """Decoupled IK for the bimanual YAM-Ultra — strict joint decoupling.
 
-Joints 1-3 satisfy position; joints 4-6 satisfy orientation. Both
-sub-problems are one damped-least-squares step per call, warm-started
-from the caller's qpos. The 6.2 cm wrist non-sphericity becomes a
-residual EE position error when the wrist rotates — that's intentional.
-The operator's visual feedback loop closes the gap.
+Joints 1-3 satisfy position, joints 4-6 orientation; each is one
+damped-least-squares step per call, warm-started from the caller's qpos.
 
-Always returns a valid qpos6 (never None). Four boundary cases are
-handled in-line so the arm degrades gracefully instead of freezing:
-
-  1. Near workspace boundary — position Jacobian becomes ill-conditioned.
-     Manipulability-adaptive damping; step magnitude smoothly shrinks
-     to zero at the singularity.
-  2. Near wrist gimbal lock (θ5 → ±π/2, joint-4/6 axes aligned) — the
-     orientation Jacobian loses rank. Same adaptive-damping recipe on
-     the wrist sub-solve: J4/J6 steps stay bounded and the lost rotation
-     direction is simply not tracked until the operator backs off.
-  3. Joint limit violation — elementwise clamp into the model's joint
-     limits. Caller
-     sees the arm reach as far as joints allow, with the residual EE
-     error left for the operator's visual loop.
-  4. Near-antipodal orientation demand (error angle past rot_err_hold) —
-     the shortest-way error direction is unstable there, so the wrist
-     parks and reports saturating limit pressure; tracking resumes once
-     the operator backs off below the gate.
-
-A `max_dq_per_joint` cap is applied at the end as a per-joint velocity
-bound — the operator-safety layer against any residual fast motion.
+`solve()` always returns a valid qpos6. Workspace edge, joint limits, wrist
+gimbal lock and near-antipodal demands are handled in-line so the arm degrades
+gracefully instead of freezing — see DESIGN.md for each case.
 """
 
 from __future__ import annotations
@@ -54,44 +33,19 @@ def _quat_wxyz_to_R(q: np.ndarray) -> np.ndarray:
 class DecoupledIKSolver:
     """Decoupled IK for the bimanual YAM-Ultra.
 
-    Holds a mujoco model with the tool0 site, plus cached site/body-id
-    lookups. `solve()` is the main entry point.
+    Holds a mujoco model with the tool0 site plus cached site-id lookups.
+    `solve()` is the main entry point.
 
-    Tunables:
-      lam_pos           DLS base damping on the 3-DoF position sub-solve.
-                        Default 0.05.
-      lam0              Extra damping ramp amplitude near the joints-1-3
-                        singularity. Total λ² = lam_pos² + lam0² · ramp²
-                        where ramp = max(0, 1 - w/w0) and
-                        w = |det(J_pos_arm)|. Default 0.15.
-      w0                Manipulability threshold where the ramp starts.
-                        Default 0.05.
-      mu                Tikhonov stiffness pulling joints 1-3 toward q_rest.
-                        Default 0.02.
-      lam_rot           DLS base damping on the 3-DoF wrist orientation
-                        sub-solve. Default 0.05.
-      lam0_rot          Extra damping ramp amplitude near wrist gimbal lock
-                        (θ5 → ±π/2). Same λ² recipe as the arm. Default 0.4.
-      w0_rot            Wrist-manipulability threshold where that ramp
-                        starts; w = |det(J_rot)| ≈ |cos θ5|. Default 0.5
-                        (ramp begins at θ5 ≈ 60° — early enough that the
-                        damping has built up by the time the Jacobian's
-                        weakest direction collapses around 70-80°).
-      rot_err_hold      Park the wrist when the orientation error angle
-                        exceeds this (rad). Near the antipode (180°) the
-                        shortest-way error direction is unstable — it
-                        flips sign under tiny target jitter — and chasing
-                        it with capped steps turns into a bang-bang
-                        oscillation at the Δq cap (operator-reported
-                        shaking when twisting far past the θ5 stop;
-                        reproduced in sim at ~150° error with 0.2° hand
-                        tremor). Beyond the gate the wrist holds still
-                        and reports limit pressure; tracking resumes as
-                        soon as the operator backs off below it.
-                        Default 2.2 (~126°).
-      q_rest            Rest pose joints 1-3 the Tikhonov term pulls toward.
-      max_dq_per_joint  Per-joint Δq cap, length 6. Bounds worst-case
-                        single-joint snap regardless of source.
+    lam_pos, lam0, w0   Position sub-solve damping: base, ramp amplitude near
+        the joints-1-3 singularity, and the manipulability threshold where the
+        ramp starts. λ² = lam_pos² + lam0²·ramp², ramp = max(0, 1 - w/w0),
+        w = |det(J_pos_arm)|.
+    mu                  Tikhonov stiffness pulling joints 1-3 toward q_rest.
+    lam_rot, lam0_rot, w0_rot   Same recipe for the wrist orientation sub-solve;
+        w = |det(J_rot)| ≈ |cos θ5|, so the 0.5 default ramps in at θ5 ≈ 60°.
+    rot_err_hold        Park the wrist past this orientation error (rad).
+    q_rest              Rest pose for joints 1-3 that the Tikhonov term targets.
+    max_dq_per_joint    Per-joint Δq cap, length 6.
     """
 
     def __init__(
@@ -126,29 +80,21 @@ class DecoupledIKSolver:
         )
 
         self.model, self.data = build_model_with_tool0_site(arm_xml_path)
-        # Joint limits straight from the compiled model (i.e. the vendored
-        # MJCF) — nothing transcribed by hand.
+        # Straight from the compiled MJCF — nothing transcribed by hand.
         self.joint_limits = self.model.jnt_range[:6].copy()
 
         self.site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "tool0"
         )
-        # Position-task anchor — a named site on link3-4, 10 cm past joint
-        # 4 along the link3→link4 direction. Fully wrist-invariant since
-        # it lives upstream of joint 4. See ik/solver.py for the exact
-        # site placement and the rationale.
+        # Position-task anchor: 10 cm past joint 4 along link3→link4, so it is
+        # wrist-invariant.
         self.j4_site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "j4_anchor"
         )
         if -1 in (self.site_id, self.j4_site_id):
             raise RuntimeError("DecoupledIKSolver: required site missing from model")
 
-        # Set by each solve(). Signals fed into the controller-haptic
-        # mix downstream:
-        #   last_limit_pressure (rad)          — joint-limit clip this tick.
-        #   last_pos_err_norm (m)              — workspace-boundary reach error.
-        #   last_singularity_proximity (0..1)  — joints-1-3 damping ramp.
-        #   last_wrist_gimbal_proximity (0..1) — wrist (gimbal) damping ramp.
+        # Set by each solve(); fed into the controller-haptic mix downstream.
         self.last_limit_pressure: float = 0.0
         self.last_pos_err_norm: float = 0.0
         self.last_singularity_proximity: float = 0.0
@@ -170,10 +116,11 @@ class DecoupledIKSolver:
         return pos, quat
 
     def j4_anchor_xpos(self) -> np.ndarray:
-        """World position of the j4_anchor site at the most recent FK. This
-        is the wrist-invariant point the position task targets; the pose
-        mapper should use it as the rotation pivot so pure controller
-        rotations leave joints 1-3 at rest."""
+        """World position of the j4_anchor site at the most recent FK.
+
+        The wrist-invariant point the position task targets; the pose mapper
+        uses it as the rotation pivot so pure rotations leave joints 1-3 at rest.
+        """
         return self.data.site_xpos[self.j4_site_id].copy()
 
     def solve(
@@ -182,22 +129,18 @@ class DecoupledIKSolver:
         target_quat_wxyz: np.ndarray,
         qpos_seed: np.ndarray,
     ) -> np.ndarray:
-        """One step of decoupled IK.
+        """One step of decoupled IK. Always returns a valid 6-vector.
 
-        Always returns a valid 6-vector. Four boundary cases (workspace
-        edge, joint limits, wrist gimbal lock, near-antipodal demand)
-        are handled in-line — the arm degrades gracefully instead of
-        freezing. See module docstring.
+        target_pos: tool0 position in arm base (3,).
+        target_quat_wxyz: tool0 orientation (4,).
+        qpos_seed: warm start, at least 6 long.
+        Returns: clamped joint positions (6,).
         """
         target_pos = np.asarray(target_pos, dtype=float).reshape(3)
         R_target = _quat_wxyz_to_R(target_quat_wxyz)
 
-        # ----- Step 1: FK at the seed; read the *current* (tool0 → j4)
-        # vector in tool0's local frame. Re-deriving this every tick (vs
-        # caching at rest-wrist) keeps the position-task math
-        # self-consistent with the wrist configuration we're actually at,
-        # so a re-anchor (engage / scale change / stale recovery) with
-        # target == current_ee produces pos_err = 0 exactly. -----
+        # Step 1: FK at the seed; read the current (tool0 → j4) vector in tool0's
+        # frame. Re-derived each tick so a re-anchor gives pos_err = 0 exactly.
         self._fk(qpos_seed)
         current_tool0 = self.data.site_xpos[self.site_id].copy()
         current_R_tool0 = self.data.site_xmat[self.site_id].reshape(3, 3).copy()
@@ -215,10 +158,8 @@ class DecoupledIKSolver:
         mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.j4_site_id)
         J_pos_arm = jacp[:, :3]                  # 3x3, joints 1-3 only
 
-        # Manipulability-adaptive damping. w = |det(J_pos_arm)| measures
-        # how far joints 1-3 are from a singular configuration; damping
-        # climbs smoothly as w → 0, bounding joint velocities near the
-        # shoulder singularity without affecting tracking elsewhere.
+        # Manipulability-adaptive damping: climbs as w → 0, bounding joint
+        # velocities near the shoulder singularity without affecting tracking.
         w = abs(float(np.linalg.det(J_pos_arm)))
         ramp = max(0.0, 1.0 - w / max(self.w0, 1e-12))
         self.last_singularity_proximity = float(ramp)
@@ -236,35 +177,23 @@ class DecoupledIKSolver:
         self._fk(qpos_after_arm)
         R_cur = self.data.site_xmat[self.site_id].reshape(3, 3)
 
-        # ----- Step 4: orientation error as a world-frame rotation vector -----
-        # R_target = exp([e_rot]) · R_cur, i.e. e_rot is the angular
-        # displacement carrying the current tool0 orientation onto the
-        # target — the same (world) frame mj_jacSite's rotational Jacobian
-        # maps joint velocities into.
+        # Step 4: orientation error as a world-frame rotation vector, so
+        # R_target = exp([e_rot])·R_cur — the frame mj_jacSite maps into.
         R_err = R_target @ R_cur.T
         q_err = np.zeros(4)
         mujoco.mju_mat2Quat(q_err, np.ascontiguousarray(R_err).ravel())
         e_rot = np.zeros(3)
         mujoco.mju_quat2Vel(e_rot, q_err, 1.0)
 
-        # ----- Step 5: damped LS on the wrist — same recipe as the arm -----
-        # w = |det(J_rot)| is the wrist manipulability: the scalar triple
-        # product of the three (unit) wrist axis directions, ≈ |cos θ5| on
-        # this arm. It hits 0 at gimbal lock (joint-4/6 axes aligned), where
-        # the closed-form Euler extraction this replaced blew up (measured
-        # 68° of J4/J6 demand per 1° of target twist at θ5 = 89.5°). Damping
-        # ramps in smoothly instead: J4/J6 steps stay bounded and the lost
-        # rotation direction simply stops being tracked until the operator
-        # backs off. Differential steps are also continuous by construction,
-        # so the old ±2π branch-unwrap heuristics are unnecessary.
+        # Step 5: damped LS on the wrist, same recipe as the arm. w = |det(J_rot)|
+        # ≈ |cos θ5| hits 0 at gimbal lock; damping keeps J4/J6 steps bounded.
         mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.site_id)
         J_rot = jacr[:, 3:6]                     # 3x3, wrist joints 4-6
         w_rot = abs(float(np.linalg.det(J_rot)))
         ramp_rot = max(0.0, 1.0 - w_rot / max(self.w0_rot, 1e-12))
         self.last_wrist_gimbal_proximity = float(ramp_rot)
-        # Antipode gate: with the error angle past `rot_err_hold`, the
-        # shortest-way direction of e_rot is unstable (it flips at 180°) —
-        # park the wrist instead of chasing it (see the class docstring).
+        # Antipode gate: past `rot_err_hold` the shortest-way direction of e_rot
+        # flips under jitter, so park the wrist rather than chase it.
         wrist_parked = float(np.linalg.norm(e_rot)) > self.rot_err_hold
         if wrist_parked:
             dq_wrist = np.zeros(3)
@@ -278,15 +207,8 @@ class DecoupledIKSolver:
         qpos6 = np.concatenate([new_q123, new_q456])
         qpos6_reachable = np.clip(qpos6, self.joint_limits[:, 0], self.joint_limits[:, 1])
 
-        # Limit pressure = L2 distance from the unclamped step to the
-        # clamped one — how hard this tick pushes joints into their stops.
-        # Unreachable orientations near gimbal no longer surface here (the
-        # damped step stays small); they show up as
-        # last_wrist_gimbal_proximity instead. Excludes the per-tick rate
-        # caps below, which are speed limits, not unreachability. A parked
-        # wrist (antipode gate above) takes no step at all, so it reports a
-        # saturating pressure directly — the operator is pushing somewhere
-        # maximally unreachable and should feel it.
+        # L2 distance from unclamped to clamped step: how hard this tick pushes
+        # into the stops. Excludes the rate caps below, which are speed limits.
         self.last_limit_pressure = float(
             np.linalg.norm(qpos6 - qpos6_reachable)
         )
@@ -328,8 +250,7 @@ def _self_test() -> None:
         target_quat = np.zeros(4)
         mujoco.mju_mat2Quat(target_quat, solver.data.site_xmat[solver.site_id])
 
-        # Seed with home pose (equals q only for the first case; the rest
-        # exercise a single capped Newton step from a distant seed).
+        # Equals q only for the first case; the rest exercise one capped step.
         seed = np.array([0.0, np.pi/2, np.pi/2, 0.0, 0.0, 0.0, 0.0, 0.0])
         result = solver.solve(target_pos, target_quat, seed)
 
@@ -344,8 +265,7 @@ def _self_test() -> None:
         diff = float(np.linalg.norm(result - q[:6]))
         print(f"{label:22s}  {diff:.4f}  |  {pos_err*1000:5.1f} mm  |  {rot_err:.3f}")
 
-    # Boundary-handling smoke tests — all should return a valid 6-vector,
-    # no None, no exception.
+    # Boundary handling: all should return a valid 6-vector, no exception.
     print("\nboundary checks (target placed deliberately bad):")
     seed = np.array([0.0, np.pi/2, np.pi/2, 0.0, 0.0, 0.0, 0.0, 0.0])
     far_pos = np.array([2.0, 0.0, 0.4])   # way past reach
@@ -362,9 +282,8 @@ def _self_test() -> None:
     print(f"  wrist near gimbal: qpos6 finite={bool(np.all(np.isfinite(out)))}  "
           f"θ5={out[4]:.4f}")
 
-    # Gimbal conditioning: a 1° twist of the target near θ5 = 88° must not
-    # demand a large J4/J6 step. The closed-form Euler extraction this
-    # solver replaced demanded ~27° here; the damped wrist stays bounded.
+    # A 1° twist near θ5 = 88° must not demand a large J4/J6 step; the
+    # closed-form extraction this replaced demanded ~27°.
     raw = DecoupledIKSolver()   # no Δq cap — observe the raw step
     q88 = np.array([0.2, 1.4, 1.6, 0.3, np.radians(88.0), 0.2, 0.0, 0.0])
     pos88, quat88 = raw.fk(q88)
@@ -386,9 +305,8 @@ def _self_test() -> None:
           f"{np.degrees(worst):.2f}°  [{'ok' if ok else 'FAIL'}]")
     assert ok, "wrist step near gimbal not bounded — damping broken?"
 
-    # Convergence: iterating the differential wrist on a fixed reachable
-    # target must drive the orientation error to ~zero (the closed form
-    # was exact in one step; the damped step must get there iteratively).
+    # Iterating the differential wrist on a fixed reachable target must drive
+    # the orientation error to ~zero.
     q_t = np.array([0.3, 1.4, 1.6, -0.2, 0.3, 0.4])
     raw._fk(q_t)
     t_pos = raw.data.site_xpos[raw.site_id].copy()
@@ -407,11 +325,8 @@ def _self_test() -> None:
           f"pos_err={pos_err_mm:.1f} mm  [{'ok' if ok else 'FAIL'}]")
     assert ok, "iterated solve did not converge to the target pose"
 
-    # Antipode gate: a demand ~150° away must PARK the wrist (zero step,
-    # saturating limit pressure) while ~100° away still tracks. Guards the
-    # bang-bang oscillation seen on hardware when the operator twists far
-    # past the θ5 stop and keeps going (near 180° the shortest-way error
-    # direction flips under tiny jitter).
+    # ~150° away must park the wrist (zero step, saturating pressure) while
+    # ~100° still tracks — guards the bang-bang oscillation seen on hardware.
     q0 = np.array([0.0, np.pi/2, np.pi/2, 0.0, 0.3, 0.0, 0.0, 0.0])
     p0, quat0 = raw.fk(q0)
     R0 = _quat_wxyz_to_R(quat0)

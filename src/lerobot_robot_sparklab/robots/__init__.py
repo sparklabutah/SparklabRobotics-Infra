@@ -1,8 +1,4 @@
-"""One subpackage per robot in the lab.
+"""One subpackage per robot: kinematics, IK, hardware bridge, teleoperator, rig config.
 
-Each robot owns everything specific to it — kinematics/MJCF, IK, the
-hardware bridge to its motor driver, its LeRobot Robot adapter, its
-teleoperator, and its rig config (camera serials, CAN channels). Anything
-genuinely reusable belongs one level up in relay/, quest/, core/, cameras/
-or tools/ instead.
+Anything reusable belongs one level up in relay/, quest/, core/, cameras/ or tools/.
 """

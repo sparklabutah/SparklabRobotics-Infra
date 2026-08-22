@@ -6,20 +6,9 @@ three RealSense cameras, driven by Quest teleoperation or a LeRobot policy.
     --teleop.type=bi_quest_teleop | single_arm_quest_teleop
 
 The arms run in their own processes (``arm_server.py``), reached over portal
-RPC via ``arm_client.py``.
-
-The re-exports below are required: LeRobot's ``make_device_from_device_class``
-resolves a Robot class from the **direct parent package** of its Config's
-module and never walks further up.
-
-DEFERRAL. Every ``lerobot-*`` CLI imports every installed ``lerobot_robot_*``
-distribution, so while the pre-restructure package (``lerobot_robot_yam_ultra``,
-../SparkRobot) is also installed both claim the same three names. LeRobot's
-registry raises on whichever import happens to run second, and that import
-aborts partway — silently dropping whatever it had not yet registered. Rather
-than let import order decide, this package skips the shared names entirely
-whenever the predecessor is installed, so the hardware-tested code always wins
-them. Uninstall the predecessor and the skip stops on its own.
+RPC via ``arm_client.py``. The re-exports below are required by LeRobot's
+class resolution, and the name deferral below handles a co-installed
+predecessor distribution — see DESIGN.md for both.
 """
 
 import importlib.metadata as _md
@@ -68,18 +57,13 @@ if not _DEFER:
         _skipped("yam_ultra_bimanual", exc)
 
 # --- Isaac-backed simulator -------------------------------------------------
-# Unguarded on purpose: "yam_ultra_sim" is unique to this distribution, so a
-# collision would be a genuine conflict worth failing on. It imports nothing
-# from follower.py, so it survives the follower being skipped above.
+# Unguarded on purpose: "yam_ultra_sim" is unique here, so a collision is a
+# genuine conflict. Imports nothing from follower.py, so it survives the skip.
 from .sim_follower import YamUltraSim, YamUltraSimConfig  # noqa: F401,E402
 
 # --- teleoperators ----------------------------------------------------------
-# Registers bi_quest_teleop / single_arm_quest_teleop as an import side effect.
-#
-# Do NOT pre-bind `teleop = None` above this. `from . import teleop` imports the
-# submodule only when the parent lacks that attribute (CPython's
-# _handle_fromlist: `elif not hasattr(module, x)`), so a placeholder makes the
-# import a silent no-op — nothing raises, the teleoperators just never register.
+# Do NOT pre-bind `teleop = None` above this: `from . import teleop` only imports
+# the submodule when the parent lacks the attribute, so it would silently no-op.
 if not _DEFER:
     try:
         from . import teleop  # noqa: F401
