@@ -1,53 +1,25 @@
 """BiQuestTeleoperator — bimanual VR teleoperation via WebXR/Quest.
 
-Subscribes to a relay-mode FastAPI server's `/ws` and reads `xr_frame`
-broadcasts (controller poses + buttons + headset pose). Per arm,
-maintains a `ClutchPoseMapper` and a `DecoupledIKSolver`; on the rising edge
-of the grip button, captures the engage frame and starts running
-differential IK each tick. `get_action()` returns the joint action
-dict matching `YamUltraFollower.action_features`:
+Reads `xr_frame` from the relay's /ws; per arm keeps a ClutchPoseMapper and a
+DecoupledIKSolver. `get_action()` returns {left,right}_joint_{1..6}.pos (rad)
+and {left,right}_gripper.pos (0..1), matching YamUltraFollower.action_features.
 
-    {left,right}_joint_{1..6}.pos   (radians)
-    {left,right}_gripper.pos        (normalized 0..1)
+Per tick `_update_arm` runs: staleness gate -> EMA pose filter -> precision
+button -> clutch edges -> IK step -> haptic mix.
 
-Standard LeRobot-style loop:
+FRAME — ground-referenced and fixed. Controller deltas are rotated into the arm
+base by `r_calib` alone; the headset pose is never read, so the operator does
+not have to wear it. WebXR `local-floor` is already Y-up with the origin on the
+floor. "Forward" is whichever way the operator faced at session start, so
+re-centre the headset (or re-fit r_calib) if forward ends up wrong.
 
-    teleop = BiQuestTeleoperator(BiQuestTeleoperatorConfig(...))
-    follower = YamUltraFollower(...)
-    teleop.connect(); follower.connect()
-    while True:
-        follower.send_action(teleop.get_action())
-        time.sleep(1/freq)
+CLUTCH — every engage captures the controller pose AND the arm's current EE
+pose, so motion always resumes from where the arm actually is. Walking around
+between engages changes nothing: the delta is measured from the newest engage,
+never from an accumulated origin.
 
-Per-tick pipeline inside `_update_arm`:
-
-  1. Staleness gate — if no `xr_frame` for > XR_FRAME_STALE_TIMEOUT_S,
-     mark `needs_reanchor` and skip the tick. On the first fresh tick
-     after recovery, the engage frame is silently re-captured so the
-     delta-since-engage restarts at zero (no catch-up motion).
-  2. EMA pose filter — smooths sub-tick WebXR jitter on the controller
-     pose before downstream consumers see it (`pose_filter_alpha`).
-  3. Precision button (A/X) — on transition, re-anchor the engage
-     frame before changing the mapper gains. On the legacy absolute
-     path this prevents the accumulated delta being reinterpreted
-     under the new scale; on the reach-limited incremental path it simply
-     realigns hand↔EE correspondence.
-  4. Clutch edges — rising → `_anchor_mapper` (captures controller
-     pose, EE pose, J4 anchor as rotation pivot, applies yaw
-     correction); falling → mapper.disengage().
-  5. Yaw correction — R_engage = R_CALIB · R_y(-yaw_now). R_CALIB is a
-     fixed body→arm-base rotation; the runtime yaw_now subtraction
-     keeps "controller forward" = "arm forward" wherever the operator
-     happens to be facing in the room.
-  6. IK step — FK at the last commanded qpos gives the current EE
-     pose, passed into mapper.target() to enable the absorbing demand
-     reach limits (rot_reach_limit / pos_reach_limit); DecoupledIKSolver.solve() then steps
-     qpos[:6] toward the reach-limited target. Gripper qpos[6:8] mirrored
-     from the trigger for the sim viewer.
-  7. Haptic mix — max of (limit_pressure, pos_err_norm,
-     singularity_proximity, wrist_gimbal_proximity); EMA-smoothed and
-     broadcast in ik_state for the client to vibrate the matching
-     controller.
+The IK step takes the current EE pose from FK of the last COMMANDED qpos, not
+from the robot — an open loop that the idle resync exists to correct.
 """
 
 from __future__ import annotations
@@ -85,10 +57,6 @@ logger = logging.getLogger(__name__)
 
 
 # Default rotation taking Quest `local-floor` world axes into the arm base
-# frame: arm_x = -quest_z (operator-forward), arm_y = -quest_x
-# (operator-left), arm_z = +quest_y (up). Derived empirically for the
-# original lab mounting; override via `BiQuestTeleoperatorConfig.r_calib`
-# if your robot faces the operator differently (see the README).
 DEFAULT_R_CALIB = [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
 
 GRIP_BUTTON_INDEX = 1  # boolean: clutch
@@ -120,34 +88,15 @@ GRIPPER_QPOS_OPEN = 0.001
 GRIPPER_QPOS_CLOSED = -0.045
 
 
-def _yaw_from_quat_xyzw(q_xyzw) -> float:
-    """Yaw about world-up (+Y), in radians, from a (x, y, z, w) WebXR quat."""
-    x, y, z, w = (float(v) for v in q_xyzw)
-    return float(np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + z * z)))
-
-
-def _R_y(angle: float) -> np.ndarray:
-    c, s = np.cos(angle), np.sin(angle)
-    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
-
-
 @TeleoperatorConfig.register_subclass("bi_quest_teleop")
 @dataclass
 class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     """Config for BiQuestTeleoperator.
 
-    `ws_url` points at the FastAPI relay server hosting the WebXR page.
-    `publish_ik_state` makes the teleop send its computed qpos back to the
-    server so the existing viewer_client.py + Quest UI keep mirroring.
-    `connect_timeout_s` bounds connect()'s wait for the WS handshake.
-
-    `rest_qpos_left` / `rest_qpos_right` are six joint angles (rad) per arm.
-    They serve two roles: (a) the teleop initialises each arm's qpos here
-    so the first `send_action` moves the physical follower toward the
-    rest pose; (b) the IK Tikhonov bias pulls toward this pose, breaking
-    the elbow-flip ambiguity. Default is the elbow-up
-    [0, π/2, π/2, 0, 0, 0]; override per machine to match wherever your
-    setup parks the arms.
+    `rest_qpos_left` / `rest_qpos_right` (six joint angles, rad) do two jobs: the
+    teleop initialises each arm's qpos there, and the IK Tikhonov bias pulls toward
+    it, which is what breaks the elbow-flip ambiguity. Default is elbow-up
+    [0, π/2, π/2, 0, 0, 0]; override to match where your rig parks.
     """
 
     ws_url: str = "ws://127.0.0.1:8443/ws"
@@ -168,124 +117,39 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     lam0: float = 0.15  # Adaptive-damping ramp amplitude near singular
     w0: float = 0.05  # Manipulability threshold where ramp starts
     mu: float = 0.02  # Tikhonov stiffness toward q_rest
-    # Wrist (orientation sub-solve) damping — same recipe, separate scale:
-    # the wrist manipulability |det J_rot| ≈ |cos θ5| lives in [0, 1].
     lam_rot: float = 0.05  # Orientation-solve base damping
     lam0_rot: float = 0.4  # Extra damping ramp amplitude near wrist gimbal
     w0_rot: float = 0.5  # Wrist-manipulability threshold where ramp starts
-    # Reach limits: the target may run at most this far ahead of the arm's
-    # CURRENT pose; the excess is absorbed, mouse-at-screen-edge style (see
-    # ClutchPoseMapper docstring). Rotation becomes incremental under the
-    # reach limit — pressing past a joint stop / gimbal can neither build up the
-    # near-180° error that shakes the wrist at the Δq cap, nor wrap around
-    # and snap in from the other side; position overshoot is absorbed the
-    # same way so reversal bites immediately. Cost: hand↔EE correspondence
-    # drifts within an engagement (absorbed motion is gone; scale_rotation≠1
-    # additionally rate-scales rotation increments, path-dependent on curved
-    # hand paths) — re-clutching realigns. Smaller reach limit = firmer "wall" at
-    # stops and less posture windup near gimbal; larger = more headroom for
-    # very fast motions before absorption. 0 disables either reach limit.
+    
     rot_reach_limit: float = 0.6  # rad (~34°)
     pos_reach_limit: float = 0.25  # m
-    # Solver backstop: park the wrist when the orientation error exceeds
-    # this (rad). With the reach limit on it never fires; exposed mainly so the
-    # no-limit comparison demo can disable it (> 3.15 = off, since the
-    # error angle can't exceed π) and show the raw absolute-mapping flip
-    # at 180°.
     rot_err_hold: float = 2.2
     scale_translation: float = 1.5  # controller→EE translation gain
     scale_rotation: float = 1.5  # controller→EE rotation gain (<1 = softer)
-    # While the A/X precision button is held, both scale_translation and
-    # scale_rotation are multiplied by this factor for finer positioning.
-    # 0.5 is the historical default; the web UI exposes a slider.
     precision_factor: float = 0.5
-    # EMA on the incoming controller pose (per arm). 1.0 = no smoothing
-    # (raw passthrough), lower = more smoothing + more latency. Smooths
-    # sub-tick WebXR jitter before it reaches the IK / pose mapper. At
-    # 200 Hz IK rate, 0.5 ≈ 7 ms time constant, 0.3 ≈ 22 ms.
+
+    # EMA on the incoming controller pose. 1.0 = raw, lower = smoother and
+    # laggier. At a 200 Hz IK rate, 0.5 ≈ 7 ms time constant, 0.3 ≈ 22 ms.
     pose_filter_alpha: float = 0.8
-    # Per-joint Δq cap (rad/tick). Bounds the worst-case single-joint snap
-    # from any source (e.g. workspace-edge catch-up). None to disable.
-    # The web UI exposes two scalar shortcuts (`_pos` for joints 1-3 driving
-    # EE position, `_rot` for joints 4-6 driving EE orientation) — operators
-    # found that one shared cap held wrist motion back while position was
-    # fine, so the groups stay independently tunable. Defaults: position
-    # 0.06 rad/tick (12 rad/s at a 200 Hz loop, 3 rad/s at 50 Hz), rotation
-    # 0.24 rad/tick (48 rad/s @ 200 Hz). The wrist needs the higher cap: at
-    # 0.06 it felt sluggish and held wrist motion back during fine tasks, so
-    # rotation is set 4x higher than position.
     max_dq_per_joint: list[float] | None = field(
         default_factory=lambda: [0.06, 0.06, 0.06, 0.24, 0.24, 0.24]
     )
-    # Web-tunable shortcuts. Writing either through `config_update` (a)
-    # rebuilds `max_dq_per_joint = [pos]*3 + [rot]*3` and (b) pushes the
-    # new array into each live DecoupledIKSolver, so a slider drag takes
-    # effect on the very next solve. Initial values mirror the per-joint
-    # default above; not used as a source-of-truth after that.
+
     max_dq_per_joint_scalar_pos: float = 0.06
     max_dq_per_joint_scalar_rot: float = 0.24  # 4x position (48 rad/s @ 200 Hz)
-    # ── Force haptic (gripper torque → controller vibration) ──
-    # Linear scaling with a dead zone:
-    #   intensity = clip((|τ| - threshold) / (max - threshold), 0, 1)
-    # Defaults sized to the YAM's LINEAR_4310 gripper (max_gripper_torque=1.0
-    # Nm in the follower config). Bump the per-arm threshold to silence idle baseline
-    # buzz on that arm specifically (static holding torque differs between
-    # individual grippers, so we deadband independently); bump `max_nm` if
-    # you want the buzz to stay subtle even at max grip. The web Settings
-    # panel exposes a "Calibrate" button that samples idle torque for a few
-    # seconds and writes the per-arm thresholds via config_update.
+
     force_haptic_threshold_nm_left: float = 0.35
     force_haptic_threshold_nm_right: float = 0.35
     force_haptic_max_nm: float = 1.0
-    # Inertia / kinetic-friction compensation. Adds `k * |v|` to the
-    # effective threshold, where `v` is the numerical gripper velocity
-    # (units of normalized pos per second, computed from successive
-    # `gripper.pos` samples sent alongside the torque). Higher = more
-    # masking during fast opens/closes. 0 disables velocity compensation.
     force_haptic_velocity_comp_nm: float = 0.5
-    # Master on/off for the force haptic, toggled live from the Settings
-    # panel on the web. When False the intensity is forced to 0; threshold
-    # / max / velocity-comp values are kept untouched so flipping back on
-    # picks up where you were.
     force_haptic_enabled: bool = True
-    # Duration (s) of the per-arm "go home" ramp triggered by a thumbstick
-    # press. The ramp linearly interpolates qpos[:6] from current to
-    # `rest_qpos_{hand}` over this window. On completion, if the arm is
-    # still engaged, the engage frame is re-anchored at the rest pose so
-    # the operator's hand motion resumes with zero delta — no jump.
+
+    # Thumbstick "go home" ramp: linearly interpolate qpos[:6] to
+    # rest_qpos_{hand} over this window, then re-anchor so motion resumes with
+    # zero delta.
     rest_ramp_duration_s: float = 2.0
 
-    # ── Idle resync / auto-stow ──
-    # Root cause of the "arm drifts to a weird position over a long session"
-    # class of bug: arm["qpos"] is a pure open-loop integrator — every IK
-    # tick warm-starts DecoupledIKSolver.solve() from the teleop's OWN
-    # previous qpos, and every re-anchor (_anchor_mapper) computes "current
-    # EE pose" via FK of that same belief, never from the robot's actual
-    # measured position. So anything that makes the real arm fall short of
-    # what a tick commanded — the follower's own Δq/velocity clamp engaging
-    # (confirmed happening regularly on this rig's hardware logs), motor PD
-    # tracking lag under load — is invisible and permanent: nothing ever
-    # compares belief against reality to correct it. The only thing that
-    # ever has was, until now, a full seed_qpos_from_obs() at connect() or
-    # an explicit thumbstick stow.
-    #
-    # This closes that gap automatically, but only while BOTH hands are
-    # disengaged (no grip held) — never while the operator is actively
-    # driving, so it can't fight or interrupt an intervention.
-    #
-    # idle_resync_interval_s: while both hands are disengaged, resync
-    # qpos + gripper from the follower's measured pose at most this often
-    # (via seed_qpos_from_obs — no physical motion, just corrects belief).
-    # None/0 disables. On by default: it never moves the arm, so there's no
-    # motion-safety reason to opt in.
     idle_resync_interval_s: float | None = 1.0
-    # auto_stow_idle_s: after this many CONSECUTIVE seconds with both hands
-    # disengaged, physically ramp both arms home via the follower's park()
-    # (same joint-space ramp the thumbstick uses) — a periodic, unattended
-    # "return to a known-safe pose and resync" independent of whether the
-    # operator remembers to hit the thumbstick or disarm. None disables.
-    # Off by default: unlike the resync above, this DOES move the arm on
-    # its own after a timeout with no operator action — opt in deliberately.
     auto_stow_idle_s: float | None = None
 
 
@@ -303,25 +167,12 @@ class BiQuestTeleoperator(Teleoperator):
                 f"r_calib must be a 3x3 rotation matrix, got shape {self._r_calib.shape}"
             )
 
-        # Per-arm state. Lock guards reads/writes from the LeRobot thread vs
-        # the WS receiver thread vs the idle-resync thread (see
-        # _idle_resync_loop). Reentrant because _update_arm -> _stow_arm ->
-        # seed_qpos_from_obs re-acquires it from the same thread that
-        # get_action() already holds it on.
         self._lock = threading.RLock()
         self._latest_xr_frame: dict | None = None
-        # Set in connect() when a YamUltraFollower is present, which switches
-        # the thumbstick from the internal rest_qpos ramp to _stow_arm().
         self._stow_follower = None
-        # Idle resync / auto-stow (see BiQuestTeleoperatorConfig) — tracked
-        # once per teleoperator, not per-arm, since both are whole-body
-        # (seed_qpos_from_obs and park() both act on both hands at once).
         self._idle_since: float | None = None       # monotonic ts both hands went disengaged
         self._last_idle_resync_t: float = 0.0
         self._auto_stowed_this_idle: bool = False    # avoid re-parking every tick while still idle
-        # Wall-clock timestamp of the most recent xr_frame. Used to detect
-        # network/WS staleness and force a safe disengage so we never
-        # capture an engage frame from outdated controller data.
         self._last_xr_frame_time: float = 0.0
 
         rest_qpos = {
@@ -365,36 +216,19 @@ class BiQuestTeleoperator(Teleoperator):
                 "trigger": 0.0,
                 "engaged": False,
                 "haptic": 0.0,  # smoothed 0..1, broadcast in ik_state
-                "force_haptic": 0.0,  # gripper-torque-driven haptic (set by send_feedback)
-                # Numerical gripper-velocity tracking for inertia masking.
-                # `prev_gripper_pos` / `prev_gripper_t` are filled on the
-                # first feedback tick; `vel_filt` keeps an EMA-smoothed
-                # value (rad-equivalent / s) so per-tick noise doesn't
-                # spike the threshold.
+                "force_haptic": 0.0,  
                 "prev_gripper_pos": None,
                 "prev_gripper_t": None,
                 "gripper_vel_filt": 0.0,
                 "needs_reanchor": False,  # set during stale → re-anchor on recovery
                 "pos_filt": None,  # EMA-smoothed controller position
                 "quat_filt": None,  # EMA-smoothed controller orientation (wxyz)
-                # Per-arm "go home" ramp (thumbstick-click trigger). While
-                # `ramp_active`, qpos[:6] is linearly interpolated from
-                # `ramp_start_q` toward `ramp_target_q` over
-                # `rest_ramp_duration_s`, bypassing IK. The mapper's engage
-                # frame is re-anchored at the rest pose on completion so
-                # the next operator motion has zero delta — no jump.
                 "last_rest_button": False,
                 "ramp_active": False,
                 "ramp_start_q": np.zeros(ARM_DOFS),
                 "ramp_target_q": q_rest.copy(),
                 "ramp_start_t": 0.0,
             }
-        # Raw per-hand button state, updated synchronously from every
-        # xr_frame in the WS reader thread. Decoupled from `arm["engaged"]`
-        # (which only updates when get_action runs) so an intervention
-        # orchestrator can read live grip/B-Y state even while the policy
-        # drives — i.e. when nothing is calling get_action(). Read via
-        # is_engaged() / is_handoff_pressed() under self._lock.
         self._buttons: dict[str, dict[str, bool]] = {
             "left": {"grip": False, "handoff": False},
             "right": {"grip": False, "handoff": False},
@@ -407,25 +241,13 @@ class BiQuestTeleoperator(Teleoperator):
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._ws_connected = threading.Event()
 
-        # Idle-resync thread — runs _check_idle_resync_and_autostow() on its
-        # own timer, independent of get_action() ever being called. Without
-        # this, a caller that drives the robot some other way while polling
-        # this teleop rarely or never (e.g. lerobot-rollout's DAgger
-        # AUTONOMOUS phase, which only calls get_action() once it's already
-        # in CORRECTING) leaves qpos frozen from before that phase started —
-        # the eventual handoff then slides the arm toward that stale,
-        # unrelated position instead of meeting wherever the policy actually
-        # left it. See idle_resync_interval_s's docstring for the resync
-        # itself; this just guarantees it keeps running either way.
+        # Own timer, so the resync runs even when get_action() does not. DAgger's
+        # autonomous phase only calls get_action() once already CORRECTING, which
+        # would leave qpos frozen from before that phase and make the handoff
+        # slide the arm to a stale position instead of meeting the policy.
         self._idle_resync_thread: threading.Thread | None = None
         self._idle_resync_stop: threading.Event | None = None
 
-        # Idle-torque calibration window (web UI "Calibrate" button). When
-        # active, every torque sample fed into `_apply_torque_feedback`
-        # contributes to per-arm peak |τ| tracking. On window end the peaks
-        # are used to compute new per-arm thresholds (peak + margin) and the
-        # result is broadcast as `haptic_calibrate_result` for the web UI to
-        # display and persist. Guarded by `self._lock`.
         self._haptic_calib: dict | None = None
 
         # Measured rate of `get_action()` calls. EMA-smoothed in get_action;
@@ -477,15 +299,11 @@ class BiQuestTeleoperator(Teleoperator):
             raise RuntimeError(f"BiQuestTeleoperator: timed out connecting to {self.config.ws_url}")
         logger.info("BiQuestTeleoperator connected to %s", self.config.ws_url)
 
-        # Best-effort auto-seed from the most recently connected
-        # YamUltraFollower, so a plain `lerobot-record` (robot.connect()
-        # then teleop.connect(), with no hook in between) doesn't leave
-        # get_action() targeting rest_qpos — an unseeded first action —
-        # until something else engages or seeds it. teleop_bimanual.py seeds
-        # explicitly itself and doesn't need this; pure_sim.py and other
-        # robot-less callers just see no follower registered, a no-op.
-        # Local import: avoids a hard, always-imported dependency from the
-        # (robot-agnostic) teleop module onto the Robot implementation.
+        # Best-effort seed from the last connected follower, so plain
+        # lerobot-record (which offers no hook between robot.connect() and
+        # teleop.connect()) does not leave the first action targeting rest_qpos.
+        # A no-op when no follower is registered. Local import to keep this
+        # module from depending on the Robot implementation.
         from ..follower import get_last_connected_follower
 
         follower = get_last_connected_follower()
@@ -522,18 +340,9 @@ class BiQuestTeleoperator(Teleoperator):
         logger.debug("BiQuestTeleoperator disconnected")
 
     def send_feedback(self, feedback: dict) -> None:
-        """Push runtime feedback from the orchestrator (a rollout loop or
-        teleop_bimanual.py) into the teleop's per-arm haptic state. The values
-        are broadcast in the next ``ik_state`` and mixed with the existing
-        IK-derived haptic on the web client.
-
-        Recognised keys today:
-            ``torques`` — dict of motor torque readings in Nm, keyed by
-                          ``{left,right}_gripper.torque`` (and friends).
-                          Only ``*_gripper.torque`` is consumed in v1.
-
-        Anything unrecognised is silently ignored so future callers can
-        add fields without breaking older teleop builds.
+        """Push orchestrator feedback into per-arm haptic state, broadcast in the
+        next ik_state. Consumes `{left,right}_gripper.torque` from a `torques` dict;
+        unrecognised keys are ignored so callers can add fields.
         """
         if not isinstance(feedback, dict):
             return
@@ -542,38 +351,22 @@ class BiQuestTeleoperator(Teleoperator):
             self._apply_torque_feedback(torques)
 
     def publish_state(self) -> None:
-        """Force one ``ik_state`` broadcast on the WS without waiting for
-        the next ``get_action()`` call.
+        """Force one ik_state broadcast without waiting for get_action().
 
-        ``ik_state`` is normally piggy-backed onto ``get_action()`` (see
-        the call at the end of ``get_action``), which means an orchestrator
-        that updates haptic state outside the action loop (e.g. sending a
-        zero-torque release frame when the human hands control back to
-        the policy) would otherwise leave the Quest controller buzzing
-        until the next correction starts. Callers should invoke this
-        whenever teleop-side state needs to reach the client now.
+        get_action() normally piggy-backs it, so an orchestrator that updates haptics
+        outside the action loop would leave the controller buzzing until the next call.
         """
         if self.config.publish_ik_state and self._ws is not None and self._ws_loop is not None:
             self._publish_ik_state_async()
 
     def _apply_torque_feedback(self, torques: dict) -> None:
-        """Map raw gripper torques (Nm) to per-arm 0..1 haptic intensity
-        via a velocity-aware dead-zone linear scaling.
-
-        Effective threshold widens when the gripper is moving fast::
+        """Map gripper torque (Nm) to 0..1 haptic intensity, velocity-aware.
 
             θ_eff = θ_base + k_v * |v_gripper|
 
-        That masks the inertial / kinetic-friction torque spike during
-        rapid opens/closes (otherwise the operator feels a buzz even with
-        nothing in the jaws). At rest, behavior is identical to the
-        previous linear-with-deadzone model. Below ``θ_eff`` intensity is
-        0; at ``force_haptic_max_nm`` (and above) it's 1.
-
-        Velocity comes from successive ``gripper.pos`` samples included
-        alongside the torque by the follower. First call after a fresh
-        connect can't differentiate (no prior sample), so velocity starts
-        at 0 — that tick uses the static threshold, fine in practice.
+        The widening threshold masks the inertial torque spike during fast opens and
+        closes, which otherwise buzzes with nothing in the jaws. Velocity comes from
+        successive gripper.pos samples, so the first tick after connect uses θ_base.
         """
         ceiling = max(1e-6, float(self.config.force_haptic_max_nm))
         kv = max(0.0, float(self.config.force_haptic_velocity_comp_nm))
@@ -646,15 +439,11 @@ class BiQuestTeleoperator(Teleoperator):
                     self._finalize_haptic_calibration()
 
     # ---------- Intervention (handoff) hooks ----------
-    # Surfaced for human-in-the-loop orchestrators (e.g. the HG-DAgger
-    # strategy in our LeRobot fork, which this stack was built for).
-    # Reads come from `self._buttons` which the WS reader populates from
-    # every xr_frame — independent of whether get_action is running. That
-    # matters because an orchestrator typically calls get_action only
-    # while the human is correcting; if these getters read
-    # `arm["engaged"]` instead, the listener would never see a fresh
-    # value while the policy drives and the handoff would never fire.
-    # Rising-edge detection is the listener's job; we report the level.
+    # For human-in-the-loop orchestrators. These read `self._buttons`, which the
+    # WS reader fills from every xr_frame, rather than `arm["engaged"]` — an
+    # orchestrator only calls get_action() while the human is correcting, so
+    # reading engaged state would never go fresh while the policy drives and the
+    # handoff would never fire. We report the level; edges are the caller's job.
 
     def is_engaged(self) -> bool:
         with self._lock:
@@ -684,33 +473,16 @@ class BiQuestTeleoperator(Teleoperator):
             return self._buttons["left"]["handoff"]
 
     def seed_qpos_from_obs(self, obs: dict[str, float]) -> None:
-        """Reset internal qpos + gripper + engagement state to match a target
-        pose dict. ``obs`` is any ``.pos``-keyed dict — either a robot
-        observation (follower-measured pose) or a *commanded* action
-        (what a policy/operator last intended; for a human-in-the-loop
-        handoff, seeding from the command keeps a gripper that is
-        squeezing an object closed instead of recording its blocked-open
-        measurement). Call before handing control to the operator so:
+        """Reset qpos / gripper / engagement to match a `.pos`-keyed dict.
 
-        1. The IK anchors to the robot's *actual* pose (not the teleop's
-           stale rest pose), and
-        2. The gripper output matches what was last commanded (no jolt
-           on the first emitted action), and
-        3. The next ``_update_arm`` sees a clean grip rising-edge and
-           re-anchors the mapper at the operator's *current* hand pose.
+        Accepts a robot observation or a *commanded* action. Seed from the command for
+        a handoff: it keeps a gripper that is squeezing an object closed, rather than
+        recording its blocked-open measurement.
 
-        Why (3) matters: if the operator released the grip while nothing
-        was calling ``get_action`` (e.g. between interventions), the
-        falling-edge handler in ``_update_arm`` never ran, so
-        ``arm["last_grip"]`` stays ``True`` and the mapper would keep the
-        *previous* intervention's engage anchor — the next intervention
-        would drive the robot to "where your hand is now relative to
-        where it was last time" instead of "no motion until you move".
-        Force-disengaging here makes the next rising-edge detection
-        unambiguous.
-
-        Expects bimanual-prefixed keys (``left_joint_1.pos``,
-        ``left_gripper.pos``, …); missing keys are silently skipped.
+        Also force-disengages. If the operator released the grip while nothing was
+        calling get_action(), the falling edge never ran and `last_grip` would still be
+        True — the mapper would then keep the previous intervention's anchor and the
+        next one would move relative to the wrong hand pose. Missing keys are skipped.
         """
         with self._lock:
             for hand in ("left", "right"):
@@ -728,13 +500,10 @@ class BiQuestTeleoperator(Teleoperator):
                     grip_qpos = GRIPPER_QPOS_OPEN + g * (GRIPPER_QPOS_CLOSED - GRIPPER_QPOS_OPEN)
                     arm["qpos"][6] = grip_qpos
                     arm["qpos"][7] = grip_qpos
-                # Cancel any in-flight go-home rest ramp: it has no
-                # ``engaged`` guard, so a ramp started before the handoff
-                # would keep overwriting ``qpos[:6]`` and clobber the seed
-                # we just wrote. We do NOT touch ``last_rest_button``: the
-                # ramp only re-arms on a rising edge of that button, so
-                # leaving it avoids spuriously restarting a ramp if the
-                # operator is still holding the thumbstick.
+                # Cancel any in-flight go-home ramp: it has no ``engaged``
+                # guard and would overwrite the seed we just wrote. Leave
+                # ``last_rest_button`` alone so a still-held thumbstick does
+                # not spuriously re-arm it.
                 arm["ramp_active"] = False
                 # Force-disengage: see docstring above. Equivalent to a
                 # clean release at the current pose, so the next tick's
@@ -808,46 +577,25 @@ class BiQuestTeleoperator(Teleoperator):
                 logger.exception("idle resync failed")
 
     def get_action(self) -> dict[str, float]:
-        # Track actual call rate (EMA over inter-call deltas). The web UI
-        # reads this from ik_state so the joint-Δq-cap readout shows the
-        # *real* rad/s, not a hardcoded assumption — the example loop
-        # defaults to 200 Hz, `lerobot-record` runs at the dataset FPS.
-        # Whatever the caller's loop runs at, this is the number that
-        # matters.
         now = time.perf_counter()
         last = self._last_get_action_t
         self._last_get_action_t = now
         if last is not None:
             dt = max(now - last, 1e-3)
             inst_hz = 1.0 / dt
-            # 0.1 EMA ≈ 1 s time-constant at 10 Hz, 200 ms at 50 Hz, 50 ms
-            # at 200 Hz — fast enough that the value tracks startup but slow
-            # enough that one slow tick doesn't make the readout flicker.
             self._loop_hz = 0.1 * inst_hz + 0.9 * (self._loop_hz or inst_hz)
 
-        # Whole body under the lock (reentrant — see its declaration) so this
-        # never interleaves with the idle-resync thread's own
-        # _check_idle_resync_and_autostow() call mutating the same per-arm
-        # state (qpos, engaged, ramp_*, ...) concurrently.
         with self._lock:
             xr = self._latest_xr_frame
             last_frame_time = self._last_xr_frame_time
-
-            # No xr_frame yet — caller gets the home pose. Both hands are
-            # necessarily disengaged (never got a grip press), so idle
-            # resync/auto-stow still applies here — e.g. the operator hasn't put
-            # the headset on yet, or the WS connection never came up at all.
             if xr is None:
                 self._check_idle_resync_and_autostow()
                 return self._build_action()
 
             gap_s = time.time() - last_frame_time
-            viewer_orient = (xr.get("viewer") or {}).get("orientation")
-            yaw_now = _yaw_from_quat_xyzw(viewer_orient) if viewer_orient is not None else None
-
             ctrls = xr.get("controllers") or {}
             for hand in ("left", "right"):
-                self._update_arm(hand, ctrls.get(hand), yaw_now, gap_s)
+                self._update_arm(hand, ctrls.get(hand), gap_s)
 
             self._check_idle_resync_and_autostow()
             action = self._build_action()
@@ -871,19 +619,14 @@ class BiQuestTeleoperator(Teleoperator):
         return out
 
     def _stow_arm(
-        self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray, yaw_now: float | None
+        self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray
     ) -> None:
         """Thumbstick STOW: ramp this arm home via the follower, then resync.
 
-        The follower interpolates in joint space to the pose it captured at
-        connect() (the arms' folded startup pose) — a slow bounded move that
-        IK can't perturb. This blocks for the ramp duration, so the caller's
-        loop (e.g. lerobot-record) pauses; that is deliberate, the alternative
-        is recording frames whose actions the operator never commanded.
-
-        Afterwards our qpos is resynced from the arm's real position and, if
-        the clutch is still held, the engage frame is re-anchored there so the
-        operator's next motion starts with zero delta — no jump.
+        Blocks for the ramp, which pauses the caller's loop deliberately — the
+        alternative is recording frames the operator never commanded. Afterwards qpos
+        is resynced and, if the clutch is still held, the engage frame re-anchored so
+        the operator's next motion starts with zero delta.
         """
         follower = self._stow_follower
         logger.info("%s STOW: ramping home via follower ...", hand)
@@ -898,12 +641,13 @@ class BiQuestTeleoperator(Teleoperator):
             logger.exception("%s stow: resync after ramp failed", hand)
             return
         if arm["engaged"]:
-            self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "STOW-DONE")
+            self._anchor_mapper(
+                hand, arm, pos, quat_wxyz, "STOW-DONE")
         arm["haptic"] = 0.0
         logger.info("%s STOW done.", hand)
 
     def _anchor_mapper(
-        self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray, yaw_now: float | None, label: str
+        self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray, label: str
     ) -> None:
         """Capture the mapper's engage frame at the current robot+controller
         state. Used by every re-anchor path — rising-edge engage,
@@ -911,21 +655,15 @@ class BiQuestTeleoperator(Teleoperator):
         same math, different log label."""
         ee_pos, ee_quat = arm["solver"].fk(arm["qpos"])
         j4_pos = arm["solver"].j4_anchor_xpos()
-        if yaw_now is not None:
-            R_engage = self._r_calib @ _R_y(-yaw_now)
-            arm["mapper"].set_R(R_engage)
         arm["mapper"].engage(pos, quat_wxyz, ee_pos, ee_quat, pivot_armbase=j4_pos)
         arm["engaged"] = True
         logger.debug(
-            "%s clutch %s  ee_pos=%s  j4_pos=%s  yaw_now=%s",
-            hand,
-            label,
-            ee_pos.round(3),
+            "%s clutch %s  ee_pos=%s  j4_pos=%s",
+            hand, label, ee_pos.round(3),
             j4_pos.round(3) if j4_pos is not None else "—",
-            f"{np.degrees(yaw_now):.1f}°" if yaw_now is not None else "—",
         )
 
-    def _update_arm(self, hand: str, ctrl: dict | None, yaw_now: float | None, gap_s: float) -> None:
+    def _update_arm(self, hand: str, ctrl: dict | None, gap_s: float) -> None:
         if ctrl is None:
             return
         arm = self._arms[hand]
@@ -954,28 +692,16 @@ class BiQuestTeleoperator(Teleoperator):
                     "out of range, so stow can never trigger on this hand.",
                     hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX)
 
-        # STOW — thumbstick-press OR B/Y, read and acted on BEFORE the
-        # staleness gate below, deliberately. Everything else in this
-        # function needs a fresh controller pose to be safe to act on
-        # (that's what the gate protects); stow doesn't — it hands off
-        # entirely to the follower's own joint-space ramp and only uses the
-        # raw controller pose to re-anchor afterward. Gating it on
-        # freshness would mean the one thing an operator might reach for
-        # DURING a degraded connection (get the arm somewhere safe) is
-        # exactly what stops working when the connection degrades —
-        # confirmed bug: a >0.2s WS gap (WiFi / tunnel jitter) used to make
-        # this whole function return before buttons were even read,
-        # silently eating the press.
+        # STOW — read BEFORE the staleness gate, deliberately. Everything else
+        # here needs a fresh controller pose; stow does not, since it hands off
+        # to the follower's joint-space ramp. Gating it would mean the one thing
+        # an operator reaches for during a degraded connection stops working
+        # exactly when the connection degrades.
         #
-        # B/Y (HANDOFF_BUTTON_INDEX) is included on purpose, not just the
-        # thumbstick: teleop_bimanual.py's B/Y disarm-and-ramp-home is the
-        # operator's existing muscle memory, and lerobot-record never had
-        # an equivalent — B/Y there only fed is_handoff_pressed(), a hook
-        # for an HG-DAgger orchestrator this repo doesn't include, so
-        # nothing ever consumed it and pressing it did nothing. If you DO
-        # build that orchestrator later: B/Y now has this side effect
-        # (physical stow) here too, in addition to is_handoff_pressed()
-        # still reporting its level-triggered state unchanged below.
+        # B/Y triggers it too, not just the thumbstick: that is the operator's
+        # muscle memory from teleop_bimanual.py. Note for anyone building a
+        # handoff orchestrator — B/Y now has this physical side effect on top of
+        # is_handoff_pressed() still reporting its level below.
         thumb_pressed = (
             bool(buttons[REST_RAMP_BUTTON_INDEX]["p"]) if len(buttons) > REST_RAMP_BUTTON_INDEX else False
         )
@@ -1009,7 +735,7 @@ class BiQuestTeleoperator(Teleoperator):
                 # targets the pose the arms actually powered up in, not the
                 # generic rest_qpos default, and can't be perturbed by hand
                 # motion mid-ramp since IK is out of the loop entirely.
-                self._stow_arm(hand, arm, pos_raw, quat_raw, yaw_now)
+                self._stow_arm(hand, arm, pos_raw, quat_raw)
                 return
             logger.warning(
                 "%s thumbstick: no follower registered — falling back to the internal "
@@ -1067,21 +793,16 @@ class BiQuestTeleoperator(Teleoperator):
         precision = (
             bool(buttons[PRECISION_BUTTON_INDEX]["p"]) if len(buttons) > PRECISION_BUTTON_INDEX else False
         )
-        # NB: `arm["trigger"]` and the gripper qpos are intentionally NOT
-        # updated unconditionally — that lives in the engaged-only block
-        # below so the gripper stays frozen at its last value while the
-        # operator isn't holding the clutch (otherwise pulling the trigger
-        # would still close the gripper between or before corrections).
-        # While the precision button is held, scale down the mapper's
-        # translation and rotation gains for finer EE positioning. On a
-        # press/release transition, re-anchor the engage frame at the
-        # current pose first: on the legacy absolute path the accumulated
-        # delta would otherwise be reinterpreted under the new scale (a
-        # target snap); on the reach-limited incremental path the re-anchor
-        # just realigns hand↔EE correspondence.
+        # The trigger and gripper qpos are updated in the engaged-only block
+        # below, not here, so the gripper stays frozen while the clutch is
+        # released — otherwise the trigger would close it between corrections.
+        #
+        # The precision button scales the mapper gains down for fine work; a
+        # press/release re-anchors first so the accumulated delta is not
+        # reinterpreted under the new scale.
         if precision != arm["last_precision"] and arm["engaged"]:
             self._anchor_mapper(
-                hand, arm, pos, quat_wxyz, yaw_now, "PRECISION" if precision else "FULL-SCALE"
+                hand, arm, pos, quat_wxyz, "PRECISION" if precision else "FULL-SCALE"
             )
         arm["last_precision"] = precision
         scale_factor = self.config.precision_factor if precision else 1.0
@@ -1095,12 +816,14 @@ class BiQuestTeleoperator(Teleoperator):
         # the fresh pose. Skipped if they released during the stall — that's
         # handled by the normal edge_disengage path below.
         if arm["needs_reanchor"] and arm["engaged"] and grip:
-            self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "RE-ANCHOR")
+            self._anchor_mapper(
+                hand, arm, pos, quat_wxyz, "RE-ANCHOR")
         arm["needs_reanchor"] = False
 
         # Edge-detect clutch.
         if grip and not arm["last_grip"]:
-            self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "ENGAGE")
+            self._anchor_mapper(
+                hand, arm, pos, quat_wxyz, "ENGAGE")
         elif not grip and arm["last_grip"]:
             arm["mapper"].disengage()
             arm["engaged"] = False
@@ -1138,7 +861,8 @@ class BiQuestTeleoperator(Teleoperator):
                     # Capture the controller pose + new (rest) EE as the
                     # engage frame. mapper.target() will now return ≈ rest
                     # until the hand moves — no jump on the first IK tick.
-                    self._anchor_mapper(hand, arm, pos, quat_wxyz, yaw_now, "RAMP-DONE")
+                    self._anchor_mapper(
+                hand, arm, pos, quat_wxyz, "RAMP-DONE")
                 else:
                     logger.debug("%s rest-ramp DONE (disengaged)", hand)
             arm["haptic"] *= 0.6  # decay haptic during the ramp
@@ -1153,22 +877,14 @@ class BiQuestTeleoperator(Teleoperator):
             tgt_pos, tgt_quat = out
             arm["qpos"][:ARM_DOFS] = arm["solver"].solve(tgt_pos, tgt_quat, arm["qpos"])
 
-            # Haptic feedback: take the max of four signals, all 0..1.
-            #  (a) limit_pressure (rad): joints clipped into their stops
-            #      this tick (0.05..0.30); also floored at 0.35 by the
-            #      solver when the antipode gate parks the wrist, so a
-            #      park saturates this signal.
-            #  (b) pos_err_norm (m): workspace-boundary reach, proxied by
-            #      residual position-task error. 0.03..0.13.
-            #  (c) singularity_proximity (0..1): joints-1-3 adaptive-damping
-            #      ramp. Heavy dead-zone — only kicks in when ramp ≥ 0.95,
-            #      so it warns only on the actual singular configuration,
-            #      not the wider damping ramp region.
-            #  (d) wrist_gimbal_proximity (0..1): wrist damping ramp, gated
-            #      from 0.5 so the buzz starts around ~80° of wrist pitch
-            #      and grows into the gimbal. Advance warning: near gimbal
-            #      the damped wrist goes sluggish instead of pressing into
-            #      limits, so without this there'd be no cue at all.
+            # Max of four 0..1 signals: limit_pressure (joints clipped into
+            # stops, 0.05..0.30, floored at 0.35 when the solver parks the
+            # wrist), pos_err_norm (workspace reach, 0.03..0.13),
+            # singularity_proximity (dead-zoned to ramp ≥ 0.95 so it warns only
+            # on the real singularity), and wrist_gimbal_proximity (gated from
+            # 0.5, ~80° of pitch). The last one is advance warning: near gimbal
+            # the damped wrist goes sluggish rather than pressing into a limit,
+            # so there would otherwise be no cue at all.
             pressure = float(getattr(arm["solver"], "last_limit_pressure", 0.0))
             pos_err = float(getattr(arm["solver"], "last_pos_err_norm", 0.0))
             singular = float(getattr(arm["solver"], "last_singularity_proximity", 0.0))
@@ -1205,13 +921,13 @@ class BiQuestTeleoperator(Teleoperator):
             # client should fall back to ignoring it.
             "left_force_haptic": float(self._arms["left"]["force_haptic"]),
             "right_force_haptic": float(self._arms["right"]["force_haptic"]),
-            # Compatibility shim for the existing viewer_client.py/Quest UI
-            # which read `qpos` (single arm) — surface the right arm here so
-            # things keep rendering until those clients learn the new schema.
+            # Compatibility shim for the Quest UI, which reads `qpos`
+            # (single arm) — surface the right arm here so it keeps rendering
+            # until that client learns the two-arm schema.
             "qpos": [float(v) for v in self._arms["right"]["qpos"][:NQ]],
             "engaged": bool(self._arms["right"]["engaged"]),
             # Which teleop instance produced this state. Lets passive
-            # listeners (viewer_client --from-id) pick one stream when
+            # listeners pick one stream when
             # several teleops run against the same relay, e.g. a
             # with/without-limit side-by-side comparison.
             "teleop_id": str(self.config.id) if self.config.id is not None else None,
@@ -1323,16 +1039,10 @@ class BiQuestTeleoperator(Teleoperator):
 
     # ---------- Haptic-threshold calibration (web UI button) ----------
 
-    # Margin (Nm) added on top of the observed idle peak when writing the
-    # new threshold. The peak we capture in a few-second window is *not* the
-    # worst-case static torque the arm will see over a long session — slow
-    # drift (thermal, hard-stop creep) and occasional torque-sense noise
-    # push the long-tail higher. 0.20 Nm cushion empirically silences the
-    # idle buzz across multi-minute sessions without eating into the real
-    # contact-force range (which starts well above 0.5 Nm on this gripper).
-    # Bumped up from 0.10 after operators reported intermittent buzz at the
-    # tighter setting; the contact range starts high enough that 0.20 still
-    # leaves plenty of room.
+    # Margin (Nm) over the observed idle peak. A few-second sample is not the
+    # worst case over a long session — thermal drift and torque-sense noise
+    # push the tail higher — and 0.20 empirically silences idle buzz without
+    # eating into the contact range, which starts above 0.5 Nm on this gripper.
     _HAPTIC_CALIB_MARGIN_NM: float = 0.20
     # Hard ceiling on what calibration is allowed to auto-write — paranoia
     # against a faulty gripper (cable hung up, hard-stop slam) silencing the

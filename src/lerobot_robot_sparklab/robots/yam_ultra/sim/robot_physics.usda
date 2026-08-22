@@ -1,0 +1,526 @@
+#usda 1.0
+(
+    doc = """Generate sim/robot_physics.usda -- collision + rigid-body tuning for both arms.
+
+Written by a generator rather than by hand because it is 2 arms x 9 links of
+nested `over` prims and the nesting must exactly mirror the kinematic chain;
+one wrong indent silently drops a collider.
+
+WHAT IT AUTHORS, and why each piece is needed:
+
+  instanceable = false
+      The link geometry arrives as an instanceable reference into a shared
+      /Instances scope, and you cannot author inside an instance. Dropping
+      instancing on these 9 prims per arm makes the real meshes addressable so
+      a collider can go on them. Costs a second copy of the mesh data; that is
+      the price of per-arm colliders.
+
+  PhysicsCollisionAPI + PhysicsMeshCollisionAPI, approximation = convexHull
+      The arm ships ZERO colliders, which is why the fingers pass through
+      everything. convexHull matches what yamlab uses on all 101 of its
+      collider prims, and is both cheaper and more stable than a mesh collider.
+
+  physxRigidBody:disableGravity = 1  on every link
+      Lets scene gravity be switched ON -- so objects fall and rest -- while
+      the arm neither sags nor needs gravity compensation. This is the trick
+      yamlab uses (disable_gravity=True on the arm, False on the props) and it
+      decouples "objects are dynamic" from "the controller can hold a pose".
+
+  solver iteration counts 16 / 1 on the articulation root
+      PhysX defaults (4) are not enough for a stable pinch grasp; 16 is what
+      yamlab sets, per articulation AND per graspable object.
+
+  drive maxForce
+      The URDF import left every joint at 1 N, which cannot hold the arm's own
+      weight let alone squeeze. Values are yamlab's measured motor limits:
+      28 N.m for the DM4340 shoulder joints, 10 N.m for the DM4310 elbow and
+      wrist, 100 N for the gripper.
+
+Drive STIFFNESS/DAMPING are deliberately NOT authored here. UsdPhysics angular
+drive stiffness is per DEGREE, while every published gain figure (including
+yamlab's) is per RADIAN -- authoring 800 here would silently be 57x too stiff.
+They are applied at runtime in scene.set_drive_gains(), in radian units, which
+is also what yamlab does (its USD ships zeros too).
+"""
+)
+
+over "World"
+{
+    over "YamLeft"
+    {
+        over "Geometry" (
+            prepend apiSchemas = ["PhysxArticulationAPI"]
+        )
+        {
+            int physxArticulation:solverPositionIterationCount = 16
+            int physxArticulation:solverVelocityIterationCount = 1
+            bool physxArticulation:enabledSelfCollisions = 0
+
+            over "base" (
+                prepend apiSchemas = ["PhysxRigidBodyAPI"]
+            )
+            {
+                bool physxRigidBody:disableGravity = 1
+
+                over "base" (
+                    instanceable = false
+                )
+                {
+                    over "base" (
+                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                    )
+                    {
+                        uniform token physics:approximation = "convexHull"
+                        rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                    }
+                }
+
+                over "link1" (
+                    prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                )
+                {
+                    bool physxRigidBody:disableGravity = 1
+
+                    over "link1" (
+                        instanceable = false
+                    )
+                    {
+                        over "link1" (
+                            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                        )
+                        {
+                            uniform token physics:approximation = "convexHull"
+                            rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                        }
+                    }
+
+                    over "link2" (
+                        prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                    )
+                    {
+                        bool physxRigidBody:disableGravity = 1
+
+                        over "link2" (
+                            instanceable = false
+                        )
+                        {
+                            over "link2" (
+                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                            )
+                            {
+                                uniform token physics:approximation = "convexHull"
+                                rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                            }
+                        }
+
+                        over "link3" (
+                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                        )
+                        {
+                            bool physxRigidBody:disableGravity = 1
+
+                            over "link3" (
+                                instanceable = false
+                            )
+                            {
+                                over "link3" (
+                                    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                )
+                                {
+                                    uniform token physics:approximation = "convexHull"
+                                    rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                }
+                            }
+
+                            over "link4" (
+                                prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                            )
+                            {
+                                bool physxRigidBody:disableGravity = 1
+
+                                over "link4" (
+                                    instanceable = false
+                                )
+                                {
+                                    over "link4" (
+                                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                    )
+                                    {
+                                        uniform token physics:approximation = "convexHull"
+                                        rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                    }
+                                }
+
+                                over "link5" (
+                                    prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                )
+                                {
+                                    bool physxRigidBody:disableGravity = 1
+
+                                    over "link5" (
+                                        instanceable = false
+                                    )
+                                    {
+                                        over "link5" (
+                                            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                        )
+                                        {
+                                            uniform token physics:approximation = "convexHull"
+                                            rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                        }
+                                    }
+
+                                    over "gripper" (
+                                        prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                    )
+                                    {
+                                        bool physxRigidBody:disableGravity = 1
+
+                                        over "gripper" (
+                                            instanceable = false
+                                        )
+                                        {
+                                            over "gripper" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                uniform token physics:approximation = "convexHull"
+                                                rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                            }
+                                        }
+
+                                        over "tip_left" (
+                                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                            instanceable = false
+                                        )
+                                        {
+                                            bool physxRigidBody:disableGravity = 1
+
+                                            def Cube "PadCollider" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                rel material:binding:physics = </World/GripPadMaterial>
+                                                token visibility = "invisible"
+                                                double3 xformOp:translate = (0.014, 0.03506, -0.17302)
+                                                double3 xformOp:scale = (0.034, 0.01186, 0.04692)
+                                                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                                            }
+                                        }
+
+                                        over "tip_right" (
+                                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                            instanceable = false
+                                        )
+                                        {
+                                            bool physxRigidBody:disableGravity = 1
+
+                                            def Cube "PadCollider" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                rel material:binding:physics = </World/GripPadMaterial>
+                                                token visibility = "invisible"
+                                                double3 xformOp:translate = (0.014, 0.05774, -0.17302)
+                                                double3 xformOp:scale = (0.034, 0.01186, 0.04692)
+                                                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        over "Physics"
+        {
+            over "dof_joint1"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint2"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint3"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint4"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint5"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint6"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint7"
+            {
+                float drive:linear:physics:maxForce = 100.0
+            }
+
+            over "dof_joint8"
+            {
+                float drive:linear:physics:maxForce = 100.0
+            }
+        }
+    }
+
+    over "YamRight"
+    {
+        over "Geometry" (
+            prepend apiSchemas = ["PhysxArticulationAPI"]
+        )
+        {
+            int physxArticulation:solverPositionIterationCount = 16
+            int physxArticulation:solverVelocityIterationCount = 1
+            bool physxArticulation:enabledSelfCollisions = 0
+
+            over "base" (
+                prepend apiSchemas = ["PhysxRigidBodyAPI"]
+            )
+            {
+                bool physxRigidBody:disableGravity = 1
+
+                over "base" (
+                    instanceable = false
+                )
+                {
+                    over "base" (
+                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                    )
+                    {
+                        uniform token physics:approximation = "convexHull"
+                        rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                    }
+                }
+
+                over "link1" (
+                    prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                )
+                {
+                    bool physxRigidBody:disableGravity = 1
+
+                    over "link1" (
+                        instanceable = false
+                    )
+                    {
+                        over "link1" (
+                            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                        )
+                        {
+                            uniform token physics:approximation = "convexHull"
+                            rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                        }
+                    }
+
+                    over "link2" (
+                        prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                    )
+                    {
+                        bool physxRigidBody:disableGravity = 1
+
+                        over "link2" (
+                            instanceable = false
+                        )
+                        {
+                            over "link2" (
+                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                            )
+                            {
+                                uniform token physics:approximation = "convexHull"
+                                rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                            }
+                        }
+
+                        over "link3" (
+                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                        )
+                        {
+                            bool physxRigidBody:disableGravity = 1
+
+                            over "link3" (
+                                instanceable = false
+                            )
+                            {
+                                over "link3" (
+                                    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                )
+                                {
+                                    uniform token physics:approximation = "convexHull"
+                                    rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                }
+                            }
+
+                            over "link4" (
+                                prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                            )
+                            {
+                                bool physxRigidBody:disableGravity = 1
+
+                                over "link4" (
+                                    instanceable = false
+                                )
+                                {
+                                    over "link4" (
+                                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                    )
+                                    {
+                                        uniform token physics:approximation = "convexHull"
+                                        rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                    }
+                                }
+
+                                over "link5" (
+                                    prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                )
+                                {
+                                    bool physxRigidBody:disableGravity = 1
+
+                                    over "link5" (
+                                        instanceable = false
+                                    )
+                                    {
+                                        over "link5" (
+                                            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                        )
+                                        {
+                                            uniform token physics:approximation = "convexHull"
+                                            rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                        }
+                                    }
+
+                                    over "gripper" (
+                                        prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                    )
+                                    {
+                                        bool physxRigidBody:disableGravity = 1
+
+                                        over "gripper" (
+                                            instanceable = false
+                                        )
+                                        {
+                                            over "gripper" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "PhysicsMeshCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                uniform token physics:approximation = "convexHull"
+                                                rel material:binding:physics = </World/DefaultPhysicsMaterial>
+                                            }
+                                        }
+
+                                        over "tip_left" (
+                                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                            instanceable = false
+                                        )
+                                        {
+                                            bool physxRigidBody:disableGravity = 1
+
+                                            def Cube "PadCollider" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                rel material:binding:physics = </World/GripPadMaterial>
+                                                token visibility = "invisible"
+                                                double3 xformOp:translate = (0.014, 0.03506, -0.17302)
+                                                double3 xformOp:scale = (0.034, 0.01186, 0.04692)
+                                                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                                            }
+                                        }
+
+                                        over "tip_right" (
+                                            prepend apiSchemas = ["PhysxRigidBodyAPI"]
+                                            instanceable = false
+                                        )
+                                        {
+                                            bool physxRigidBody:disableGravity = 1
+
+                                            def Cube "PadCollider" (
+                                                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
+                                            )
+                                            {
+                                                rel material:binding:physics = </World/GripPadMaterial>
+                                                token visibility = "invisible"
+                                                double3 xformOp:translate = (0.014, 0.05774, -0.17302)
+                                                double3 xformOp:scale = (0.034, 0.01186, 0.04692)
+                                                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        over "Physics"
+        {
+            over "dof_joint1"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint2"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint3"
+            {
+                float drive:angular:physics:maxForce = 28.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint4"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint5"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint6"
+            {
+                float drive:angular:physics:maxForce = 10.0
+                float physxJoint:maxJointVelocity = 573.0
+            }
+
+            over "dof_joint7"
+            {
+                float drive:linear:physics:maxForce = 100.0
+            }
+
+            over "dof_joint8"
+            {
+                float drive:linear:physics:maxForce = 100.0
+            }
+        }
+    }
+}

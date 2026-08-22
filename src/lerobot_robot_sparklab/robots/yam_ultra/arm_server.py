@@ -1,85 +1,45 @@
 """One YAM-Ultra arm, served over portal RPC from its OWN process.
 
-HOW THE WHOLE THING FITS TOGETHER
-=================================
-
-Three processes, not one::
-
-    ┌─ lerobot-rollout / lerobot-record process ──────────────┐
-    │                                                          │
-    │   policy inference (GPU, ~200ms)                         │
-    │   cameras (RealSense, own bg threads)                    │
-    │   YamUltraFollower        <- LeRobot Robot interface     │
-    │     └── YamArmClient x2   <- arm_client.py               │
-    └───────────┬──────────────────────────┬───────────────────┘
+    ┌─ lerobot-rollout / lerobot-record ──────────────────────┐
+    │  policy inference (GPU) · cameras · YamUltraFollower    │
+    │    └── YamArmClient x2                                  │
+    └───────────┬──────────────────────────┬──────────────────┘
                 │ portal RPC (localhost)   │
     ┌───────────▼────────────┐  ┌──────────▼─────────────┐
-    │ arm_server --can_left  │  │ arm_server --can_right │
-    │   ArmServer (this file)│  │   ArmServer            │
-    │   └ i2rt MotorChainRobot│ │   └ i2rt MotorChainRobot│
-    │     └ CAN thread ~88Hz  │ │     └ CAN thread ~88Hz  │
+    │ arm_server can_left    │  │ arm_server can_right   │
+    │   └ i2rt MotorChainRobot, CAN thread ~88 Hz        │
     └────────────────────────┘  └────────────────────────┘
-              ↕ CAN                        ↕ CAN
-           left arm motors            right arm motors
 
-WHY SPLIT AT ALL. i2rt's CAN thread must keep sending inside each motor's
-own watchdog window. In one process it shared a GIL with policy inference
-and got starved, and the motors reported ``loss communication`` (error 0xD)
-and killed the control loop mid-run — while every SocketCAN fault counter
-read zero, i.e. the wire was fine and the frames just weren't being sent
-often enough. Separate process = separate GIL = nothing the policy does can
-starve CAN.
+WHY SPLIT. i2rt's CAN thread must keep sending inside each motor's watchdog
+window. Sharing a GIL with policy inference starved it, and the motors reported
+``loss communication`` (0xD) mid-run while every SocketCAN fault counter read
+zero — the wire was fine, the frames just weren't sent in time. Separate
+process, separate GIL.
 
-WHO OWNS WHAT. This process owns the motors, the CAN link, and the torque.
-It holds no policy: no Δq clamp of its own, no gripper flip, no cameras, no
-idea when to park. Those all stay follower-side. The one thing it decides
-for itself is parking on its own shutdown (see SAFETY below), because the
+WHO OWNS WHAT. This process owns the motors, the CAN link and the torque, and
+holds no policy: the Δq clamp, gripper flip, cameras and park timing all stay
+follower-side. The exception is parking on its own shutdown, because the
 follower cannot help if this process is killed directly.
 
-WHAT ONE TICK LOOKS LIKE (2 round trips per arm, issued in parallel)::
+One tick is two round trips per arm, issued in parallel: ``read`` for joint
+angles, ``command_clamped`` for read+clamp+command under one lock. The follower
+computes ``caps`` (they depend on its measured tick interval, which this process
+cannot know); this end only applies them.
 
-    follower.get_observation()
-        -> "read"            -> {pos[7], alive}          # joint angles
-    follower.send_action(a)
-        -> "command_clamped" -> {sent[7], overshoot, alive}
-             server side: read present, clip step to caps, command motors
+KNOWN COST: portal's client socket spins rather than blocking while a call is in
+flight — ~1 core per client (93% at 4.4 Hz, 118% at 20 Hz, so idle spin rather
+than per-call work). Merging both arms into one server would halve it.
 
-    The follower computes `caps` (it depends on the follower's measured
-    tick interval, which this process cannot know) and sends them along;
-    this end only applies them. Read+clamp+command happen under one lock so
-    the arm cannot move between the read and the command.
-
-THE RPC SURFACE is deliberately tiny — ``identity``/``num_dofs`` at connect,
-then ``read``/``command``/``command_clamped``/``park``. Everything is plain
-numpy in dicts; portal packs it.
-
-Giving each arm its own process gives its CAN thread its own GIL, so nothing
-in the LeRobot process can starve it. The architecture (and the choice of
-portal, already an i2rt dependency) is borrowed from whats2000/lerobot's
-``bi_yam_follower``; the safety behaviour below is ours.
-
-KNOWN COST: portal's client socket spins rather than blocking while a call
-is in flight, burning ~1 core per client (measured 93% at 4.4 Hz, 118% at
-20 Hz — nearly independent of call rate, so it is idle spin, not per-call
-work). Two clients means ~2 cores of GIL-holding Python competing with the
-control loop. Merging both arms into ONE server would halve that and still
-keep CAN out of the policy process.
-
-Run one per arm — the follower connects to them, it does not start them:
+Run one per arm; the follower connects to them, it does not start them:
 
     python -m lerobot_robot_sparklab.robots.yam_ultra.arm_server \\
         --channel can_left --port 11333
 
-``--sim`` backs it with an i2rt SimRobot instead (no CAN, nothing physical
-moves), which is what ``YamUltraFollowerConfig.sim`` auto-spawns for tests.
-``scripts/start_arm_servers.sh`` launches both arms at the ports the
-follower defaults to.
+``--sim`` backs it with an i2rt SimRobot. ``scripts/start_arm_servers.sh``
+launches both at the ports the follower defaults to.
 
-SAFETY: this process owns the torque. i2rt's ``close()`` cuts it wherever
-the arm stands, so Ctrl-C here would drop the arm even though the follower
-never asked for that. ``--park-on-exit`` (default on) ramps back to the pose
-captured at startup — the folded pose the arms power up in — before closing,
-so killing the server directly is as safe as a clean follower disconnect.
+SAFETY: i2rt's ``close()`` cuts torque wherever the arm stands, so Ctrl-C would
+drop it. ``--park-on-exit`` (default on) ramps to the startup pose first.
 """
 
 from __future__ import annotations
@@ -101,14 +61,7 @@ ARM_JOINTS = 6
 
 
 class ArmServer:
-    """Wraps one i2rt robot and exposes the slice of it the follower needs.
-
-    Deliberately a *thin* surface: every policy decision (Δq clamping,
-    gripper flip, camera handling, when to park) stays in the follower, so
-    this process has no opinion beyond "own the CAN loop and keep the arm
-    from dropping". The one exception is ``park``, which is duplicated here
-    purely as a shutdown safety net — see the module docstring.
-    """
+    """Wraps one i2rt robot and exposes the slice of it the follower needs."""
 
     def __init__(self, channel: str, sim: bool = False,
                  enable_auto_recovery: bool = False) -> None:
@@ -121,22 +74,20 @@ class ArmServer:
         self._n_dofs = int(self._robot.num_dofs())
         self._lock = threading.Lock()
 
-        # Informational only — park() targets zero, not this. Logged because
-        # a startup pose far from zero means the arm was not left folded, and
-        # the first park will therefore be a long move.
+        # Informational: a startup pose far from zero means the arm was not
+        # left folded, so the first park will be a long move.
         q = np.asarray(self._robot.get_joint_pos(), dtype=float)
         logger.info("%s pose at startup: %s (park target is zero)",
                     channel, np.round(q[:ARM_JOINTS], 3).tolist())
 
     # ---- liveness -----------------------------------------------------
     def _alive(self) -> bool:
-        """False once i2rt's control loop has died (motor error / loss of
-        communication). SimRobots have no motor_chain — treat as alive.
+        """False once i2rt's control loop has died. SimRobots have no
+        motor_chain — treat as alive.
 
-        Returned with every read/command rather than exposed as its own call
-        so the follower can track it per tick without paying an extra
-        round trip: a dead chain keeps answering get_joint_pos() with the
-        last pose it read, so nothing else would reveal it.
+        Rides along with every read/command rather than being its own call: a
+        dead chain keeps answering get_joint_pos() with the last pose it read,
+        so nothing else reveals it.
         """
         chain = getattr(self._robot, "motor_chain", None)
         if chain is not None and not getattr(chain, "running", True):
@@ -150,13 +101,10 @@ class ArmServer:
     def identity(self, _data=None) -> dict:
         """What this server actually is, so a client can refuse a mismatch.
 
-        Nothing about the RPC surface distinguishes a SimRobot from real
-        motors — ``read``/``command`` look identical either way. An orphaned
-        ``--sim`` server left listening on the real port would therefore
-        absorb a hardware run silently: the follower would report a connected
-        robot, the policy would appear to run, and the real arms would never
-        move. (Observed: two orphaned sim servers held these ports across a
-        real rollout.) The client checks this at connect.
+        Nothing else distinguishes a SimRobot from real motors, so an orphaned
+        ``--sim`` server on the real port would absorb a hardware run silently
+        — connected, policy running, arms never moving. Observed. The client
+        checks this at connect.
         """
         return {"n": np.int64(self._n_dofs),
                 "sim": np.bool_(self.sim),
@@ -178,19 +126,12 @@ class ArmServer:
     def command_clamped(self, data: dict) -> dict:
         """Read present pose, clamp the requested step, command — one call.
 
-        Exists to halve the RPC rate. portal's client socket costs ~97% of a
-        core at 20 calls/s and ~12% idle (measured), and that thread holds the
-        GIL, so every round trip we remove buys back control-loop headroom.
-        This merges the follower's read-then-command pair.
+        Merges the follower's read-then-command pair to halve the RPC rate
+        (see the module docstring on portal's spin), and closes the window
+        where the arm could move between the two.
 
-        The follower still owns the *policy*: it computes ``caps`` (which
-        depend on ITS measured tick interval, something this process cannot
-        know) and passes them in. This end only applies them. Doing the read
-        and the command under one lock also closes the window where the arm
-        could move between the two, which the split version had.
-
-        Returns the pose actually commanded, so the caller needs no follow-up
-        read, plus how far the request overshot the cap so it can warn.
+        Returns the pose actually commanded plus how far the request overshot
+        the cap, so the caller needs no follow-up read.
         """
         target = np.asarray(data["target"], dtype=float)
         caps = data.get("caps")
@@ -212,25 +153,16 @@ class ArmServer:
     def park(self, data: dict | None = None) -> dict:
         """Ramp to the zero pose and hold.
 
-        Zero is the arm's canonical rest configuration — i2rt treats it as
-        such throughout (its joint-limit-violation message tells you to "move
-        the arm to zero position and power cycle the robot"), and it is the
-        pose the arms power up folded into. Targeting it rather than a pose
-        captured at connect matters: a captured pose is just wherever the arm
-        happened to be, so a run that ended mid-air would make "park" ramp to
-        mid-air and then cut torque.
+        Zero, not a pose captured at connect: zero is the arm's canonical rest
+        configuration, whereas a captured pose is just wherever the arm was, so
+        a run ending mid-air would park to mid-air and then cut torque.
 
-        Uses i2rt's own ``MotorChainRobot.move_joints()``, which already
-        interpolates in joint space, instead of re-rolling a ramp here.
-
-        NOTE: the target includes the gripper (element 7), so parking also
-        drives the gripper to 0. If you need it to hold what it is carrying,
-        target ``[zeros(ARM_JOINTS), current_gripper]`` instead.
+        NOTE: the target includes the gripper, so parking drives it to 0. To
+        hold what it is carrying, target ``[zeros(ARM_JOINTS), current]``.
         """
         duration_s = float(data.get("duration_s", 5.0)) if data else 5.0
-        # Never let this raise out of the RPC handler: portal tears the
-        # connection down on a server-side exception, and this process owns
-        # the torque — losing it mid-park is exactly when the arm drops.
+        # Never raise out of the RPC handler: portal tears the connection down
+        # on a server-side exception, and losing it mid-park drops the arm.
         try:
             with self._lock:
                 if not self._alive():
@@ -241,14 +173,8 @@ class ArmServer:
                             self.channel, duration_s)
                 target = np.zeros(self._n_dofs)
                 if hasattr(self._robot, "move_joints"):
-                    # MotorChainRobot: i2rt already interpolates in joint space.
                     self._robot.move_joints(target, time_interval_s=duration_s)
                 else:
-                    # SimRobot has no move_joints (see i2rt/robots/sim_robot.py —
-                    # it implements command_joint_pos and little else), so mirror
-                    # move_joints' own 50-step linear interpolation here rather
-                    # than teleporting, which would make sim behave nothing like
-                    # hardware.
                     steps = 50
                     start = np.asarray(self._robot.get_joint_pos(), dtype=float)
                     for i in range(steps + 1):

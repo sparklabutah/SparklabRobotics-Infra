@@ -1,5 +1,5 @@
 """Shared helpers for the VR-teleop entry points (`tools/pure_sim.py`,
-`hardware/teleop_bimanual.py`). Each script defines its own loop and CLI;
+`robots/yam_ultra/teleop_bimanual.py`). Each script defines its own loop and CLI;
 this module holds the bits that would otherwise be copy-pasted.
 """
 

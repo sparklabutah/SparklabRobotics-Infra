@@ -5,13 +5,13 @@ Two responsibilities, both per WebSocket client:
   1. Broadcast relay for pose/state messages (xr_frame, ik_state,
      config_update, … — the full set is RELAY_TYPES below) between the
      Quest browser and the pose-streaming client
-     (e.g. `hardware/teleop_bimanual.py`).
+     (e.g. `robots/yam_ultra/teleop_bimanual.py`).
 
   2. WebRTC publisher for camera tracks. Camera specs come from either
      CAM_TOP / CAM_LEFT / CAM_RIGHT env vars (v4l2 devices — a legacy
      fixed 3-slot setup) or, if VR_TELEOP_CAMERAS_YAML is set, a YAML file
      listing arbitrary cameras by id, each v4l2 (device path) or
-     RealSense (serial) — see cameras/config/cameras.yaml for the
+     RealSense (serial) — see robots/yam_ultra/config/cameras.yaml for the
      format. On webrtc_request the server opens any cameras that exist,
      creates an RTCPeerConnection with one VideoStreamTrack per camera,
      and exchanges SDP/ICE over the same WebSocket. Per-camera enable
@@ -26,8 +26,8 @@ Topology:
                    ◄═ WebRTC video ═ server                    (cv2 → aiortc tracks)
 
 Run (console script from `pip install -e ".[relay]"`):
-    vr-teleop-relay                            # bind 127.0.0.1 (USB / tunnel)
-    vr-teleop-relay --host 0.0.0.0 \
+    sparklab-relay                            # bind 127.0.0.1 (USB / tunnel)
+    sparklab-relay --host 0.0.0.0 \
         --ssl-keyfile  certs/key.pem \
         --ssl-certfile certs/cert.pem       # LAN HTTPS for direct Quest access
 """
@@ -308,7 +308,7 @@ class CameraTrack(VideoStreamTrack):
 #
 # Two ways to configure the camera set:
 #   1. VR_TELEOP_CAMERAS_YAML=/path/to/cameras.yaml — arbitrary cameras by
-#      id, v4l2 or RealSense (see cameras/config/cameras.yaml for the
+#      id, v4l2 or RealSense (see robots/yam_ultra/config/cameras.yaml for the
 #      format). Takes priority if set.
 #   2. CAM_TOP / CAM_LEFT / CAM_RIGHT env vars — a legacy fixed 3-slot
 #      v4l2 setup this relay originally shipped with.

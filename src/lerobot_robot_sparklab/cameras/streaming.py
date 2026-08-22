@@ -1,3 +1,8 @@
+"""
+Toy script for streaming all current realsense cameras to a port. This allow for viewing of the cameras remotely.
+"""
+
+
 import cv2
 import pyrealsense2 as rs
 import numpy as np
@@ -5,8 +10,6 @@ from flask import Flask, render_template_string, Response
 
 app = Flask(__name__)
 
-# TODO: Replace with your actual 3 RealSense camera serial numbers
-# You can find them using the "realsense-viewer" tool
 serial_numbers = ["353322271147", "323622272781", "243322071190"]
 pipelines = []
 

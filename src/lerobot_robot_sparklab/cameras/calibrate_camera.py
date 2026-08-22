@@ -4,7 +4,7 @@ RealSense autoexposure hunts and flickers when the camera is read at a
 fixed frame rate (as the relay and LeRobot recording both do), so each
 camera gets its sensor settings frozen once by eye and the chosen values
 copied into ``config/cameras.yaml`` for that camera's id — both
-``relay/server.py`` (live VR view) and ``hardware/follower.py`` (dataset
+``relay/server.py`` (live VR view) and ``robots/yam_ultra/follower.py`` (dataset
 recording) read them from there.
 
 Usage:

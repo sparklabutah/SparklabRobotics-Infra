@@ -1,49 +1,30 @@
 """Client for one ``arm_server`` process, shaped like an i2rt robot.
 
-WHERE THIS SITS. One of these per arm, held by ``YamUltraFollower``. It is
-the *only* thing in the LeRobot process that talks to the motors — see
-``arm_server`` for the three-process picture and why the split exists.
+One per arm, held by ``YamUltraFollower``; the only thing in the LeRobot
+process that talks to the motors. See ``arm_server`` for why the split exists.
 
-THE TRICK. This class pretends to BE an i2rt robot. It exposes the same four
-methods the follower used to call directly on ``MotorChainRobot``::
-
-    num_dofs()  get_joint_pos()  command_joint_pos()  close()
-
-so moving the arms into another process required almost no change to the
-follower. All the hard-won follower logic — Δq clamp, park-on-disconnect,
-dead-loop detection, gripper flip, camera handling — still runs where it
-always did. Only the transport underneath changed.
+It duck-types the subset of ``MotorChainRobot`` the follower actually calls —
+``num_dofs()`` / ``get_joint_pos()`` / ``command_joint_pos()`` / ``close()`` —
+so moving the arms out of process left the follower's logic (Δq clamp,
+park-on-disconnect, dead-loop detection, gripper flip, cameras) untouched.
 
 TWO CALLING STYLES:
 
-  blocking      ``get_joint_pos()`` / ``command_joint_pos()`` — simple,
-                one round trip, used by park and by anything not on the
-                hot path.
+  blocking      ``get_joint_pos()`` / ``command_joint_pos()`` — one round trip,
+                for park and anything off the hot path.
 
   async/paired  ``read_async()`` / ``command_clamped_async()`` return portal
-                *futures*; you collect them later with ``collect()``. The
-                follower uses these so it can start BOTH arms' calls before
-                waiting on either — otherwise left and right pay their round
-                trips back to back and the tick costs twice as much.
+                futures collected later with ``collect()``, so the follower can
+                start BOTH arms' calls before waiting on either. Otherwise left
+                and right pay their round trips back to back.
 
-  ``command_clamped_async`` also folds read+clamp+command into ONE call
-  instead of read-then-command, which halves round trips and removes the
-  window where the arm could move between the two.
+  ``command_clamped_async`` also folds read+clamp+command into one call, which
+  halves round trips and removes the window where the arm could move between.
 
-Deliberately duck-types the subset of ``i2rt.robots.MotorChainRobot`` that
-``YamUltraFollower`` actually calls — ``num_dofs()`` / ``get_joint_pos()`` /
-``command_joint_pos()`` / ``close()`` — so moving the arms out of process
-did not require rewriting the follower's logic. Everything hard-won there
-(the Δq clamp, park-on-disconnect, dead-loop detection, gripper flip,
-camera handling) is untouched and still runs follower-side; only where the
-CAN loop *lives* changed. See ``arm_server`` for why that move was needed.
-
-Liveness is the one addition. i2rt exposes it as ``robot.motor_chain.running``,
-an attribute the follower reads directly; over RPC that would be a round
-trip on every ``is_connected`` poll, so instead every ``read``/``command``
-response carries the flag and ``is_alive()`` returns the cached value. It is
-refreshed on every tick either way, and a dead chain is exactly the case
-where you cannot trust a separate query — ``get_joint_pos()`` keeps happily
+Liveness is the one addition. i2rt exposes it as ``motor_chain.running``; over
+RPC that would be a round trip per ``is_connected`` poll, so every response
+carries the flag and ``is_alive()`` returns the cached value. A dead chain is
+exactly the case you cannot query separately — ``get_joint_pos()`` keeps
 returning the last pose it read.
 """
 
@@ -58,15 +39,7 @@ import portal
 
 logger = logging.getLogger(__name__)
 
-# Guards a connected-but-slow server (a park ramp holds the server's lock for
-# park_duration_s). It does NOT guard a server that has died mid-run: portal's
-# call() blocks before it hands back a future, so no result timeout can fire.
-# That case is caught at connect by _await_listener; if a server dies during a
-# run the follower will block rather than raise. The arm itself is safe there
-# (the process owning torque is gone, so the motors' own watchdog stops them)
-# — it is a liveness annoyance, not a hazard.
 _CALL_TIMEOUT_S = 30.0
-
 
 class ArmServerUnreachable(RuntimeError):
     """Raised when no ``arm_server`` is listening — almost always "the
@@ -101,9 +74,8 @@ class YamArmClient:
                 f"    kill <pid>\n"
                 f"    ./scripts/start_arm_servers.sh{'  --sim' if expect_sim else ''}"
             )
-        # Channel is a warning, not an error: the follower cannot know how a
-        # given rig names its interfaces. But a swap here means left/right are
-        # mirrored, which is worth shouting about.
+        # A warning, not an error: the follower cannot know how a rig names its
+        # interfaces. But a swap means left/right are mirrored.
         if expect_channel is not None and self.channel != expect_channel:
             logger.warning(
                 "arm_server at %s is driving %r, but this follower has it configured "

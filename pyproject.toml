@@ -42,10 +42,17 @@ yam-ultra = [
 
 [project.scripts]
 sparklab-relay = "lerobot_robot_sparklab.relay.server:main"
+sparklab-harness = "lerobot_robot_sparklab.harness.server:main"
+sparklab-rollout = "lerobot_robot_sparklab.rollout.live:main"
+sparklab-rollout-ctl = "lerobot_robot_sparklab.rollout.ctl:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/lerobot_robot_sparklab"]
+packages = ["src/lerobot_robot_sparklab", "src/sparklab_sim"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/lerobot_robot_sparklab/harness/web" = "lerobot_robot_sparklab/harness/web"
+"src/lerobot_robot_sparklab/relay/web" = "lerobot_robot_sparklab/relay/web"

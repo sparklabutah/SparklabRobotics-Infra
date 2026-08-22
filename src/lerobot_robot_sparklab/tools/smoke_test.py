@@ -11,7 +11,7 @@ subscribes from the other side. Verifies:
   - trigger pull drives right_gripper.pos
   - left arm stays at home (untouched in this test)
 
-Prereqs: relay running locally (vr-teleop-relay), lerobot installed.
+Prereqs: relay running locally (sparklab-relay), lerobot installed.
 
 Run:
     python -m lerobot_robot_sparklab.tools.smoke_test

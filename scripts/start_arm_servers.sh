@@ -7,7 +7,7 @@
 # keep sending inside each motor's watchdog window, and in-process it shared
 # a GIL with policy inference and checkpoint loading, which starved it into
 # `loss communication` while every SocketCAN fault counter read zero (see
-# scripts/can_health.sh and hardware/arm_server.py).
+# scripts/can_health.sh and robots/yam_ultra/arm_server.py).
 #
 # These processes OWN TORQUE. They park the arms home on Ctrl-C / SIGTERM,
 # so stopping them is safe — but leave them running between runs rather

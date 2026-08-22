@@ -8,7 +8,7 @@ channel flags rather than the controllers.
 
 Cameras are disabled on the Follower here (`cameras={}`): the relay
 already owns the physical RealSense devices for the live VR view
-(cameras/config/cameras.yaml via run.sh), and two processes can't open the
+(robots/yam_ultra/config/cameras.yaml), and two processes can't open the
 same RealSense serial at once.
 
 The pose each arm is in at startup (folded, resting) is captured as its
@@ -116,10 +116,9 @@ def main() -> None:
         right_channel=args.right_channel,
         sim=args.sim,
         gripper_flip=args.gripper_flip,
-        # This script's own dq_caps clamp below is the safety layer; leave both
-        # of the Follower's clamps off to avoid two clamps disagreeing.
+        # This script's own dq_caps clamp below is the safety layer; leave the
+        # Follower's off to avoid two clamps disagreeing.
         max_relative_target=None,
-        max_joint_velocity=None,
         # This script parks explicitly in its finally block (and on disarm), so
         # don't ramp a second time inside disconnect(). --no-park disables both.
         park_on_disconnect=False,
@@ -198,10 +197,7 @@ def main() -> None:
                 for h in HANDS:
                     target = np.array([action[f"{h}_joint_{j}.pos"]
                                        for j in range(1, ARM_JOINTS + 1)])
-                    # Backstop: a legit IK action never moves more than the
-                    # per-tick Δq caps, so anything larger means state desync
-                    # (e.g. a seeding bug) — walk toward it at cap speed
-                    # instead of letting the motors snap.
+
                     step = target - cmd[h]
                     clamped = np.clip(step, -dq_caps, dq_caps)
                     if (np.abs(step) > dq_caps + 1e-9).any() and \

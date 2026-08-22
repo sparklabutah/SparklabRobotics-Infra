@@ -1,23 +1,23 @@
 """Pure-simulation VR teleop — no hardware follower.
 
 Runs `BiQuestTeleoperator` against the Quest pose stream and publishes
-`ik_state` back to the relay so `viewer_client.py` can render the
-resulting qpos in mujoco. Same IK pipeline as `hardware/teleop_bimanual.py` minus
-the YamUltraFollower / CAN handling — useful for testing IK behavior
-without needing the physical robot powered up.
+`ik_state` back to the relay instead of commanding motors. Same IK pipeline
+as `robots/yam_ultra/teleop_bimanual.py` minus the YamUltraFollower / CAN
+handling — useful for testing IK behavior without the physical robot
+powered up.
 
 Quick test workflow (no robot needed):
-  1. Relay server up:        vr-teleop-relay
+  1. Relay server up:        sparklab-relay
      (USB via `adb reverse` or LAN HTTPS — see the README)
-  2. Mujoco viewer up:       python -m lerobot_robot_sparklab.tools.viewer_client
-  3. This pure-sim loop:     python -m lerobot_robot_sparklab.tools.pure_sim
-  4. Quest browser → http://localhost:8443/ (USB) or
+  2. This pure-sim loop:     python -m lerobot_robot_sparklab.tools.pure_sim
+  3. Quest browser → http://localhost:8443/ (USB) or
      https://<workstation-lan-ip>:8443/ (LAN) → Start Teleop →
-     squeeze a grip, watch the arm move in the mujoco viewer.
+     squeeze a grip.
 
-Both arms are broadcast in every `ik_state` (`left_qpos` / `right_qpos`);
-the viewer renders one arm per instance — default right, pass
-`--arm left` (or run a second instance) for the left.
+`ik_state` carries both arms (`left_qpos` / `right_qpos`) for the Quest UI. To
+watch it on the workstation, use the Isaac viewport:
+
+    ./scripts/isaac_python.sh -m sparklab_sim.live
 """
 
 from __future__ import annotations
@@ -46,8 +46,9 @@ def main() -> None:
     ap.add_argument("--ws-url", default="ws://127.0.0.1:8443/ws")
     ap.add_argument("--freq", type=int, default=200, help="IK loop rate (Hz)")
     ap.add_argument("--id", default="vr-teleop-sim",
-                    help="teleop id stamped into ik_state broadcasts; pair with "
-                         "viewer_client --from-id to run several sims side by side")
+                    help="teleop id stamped into ik_state broadcasts, so a "
+                         "listener can pick one stream when several sims share "
+                         "a relay")
     add_ik_cli_args(ap)
     args = ap.parse_args()
 
