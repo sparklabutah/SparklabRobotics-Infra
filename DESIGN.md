@@ -23,31 +23,6 @@ Shared assets — the URDF, meshes, rig config — stay single-source: the sim s
 reads them **by path** out of the sibling package's tree (`sparklab_sim/paths.py`).
 One repo, one copy of the model, two interpreters, no import coupling.
 
-## Two naming rules that are load-bearing
-
-**The distribution name must keep the `lerobot_robot_` prefix.** Every
-`lerobot-*` CLI calls `register_third_party_plugins()` at startup, which scans
-installed *distributions* for names beginning with `lerobot_robot_` /
-`lerobot_teleoperator_` / `lerobot_camera_` / `lerobot_policy_` and imports the
-matching top-level module. That import runs the registration decorators, so
-every SparkLab robot becomes a valid `--robot.type=` with no wrapper script.
-One distribution covers the whole lab.
-
-**Each robot must re-export its Robot + Config from its own subpackage
-`__init__.py`.** This is separate from discovery. Once a config is chosen,
-LeRobot's `make_device_from_device_class` looks for the Robot class only in the
-**direct parent package** of the config's module and never walks up to the
-package root. Miss it and you get `ImportError: Could not locate device class`.
-
-### Deferring to a predecessor distribution
-
-Because every `lerobot-*` CLI imports every installed `lerobot_robot_*`
-distribution, a co-installed predecessor (`lerobot_robot_yam_ultra`) claims the
-same three names. LeRobot's registry raises on whichever import runs second,
-and that import aborts partway, silently dropping whatever it had not yet
-registered. Rather than let import order decide, this package skips the shared
-names whenever the predecessor is installed, so the hardware-tested code always
-wins them. Uninstall the predecessor and the skip stops on its own.
 
 ## The arms run in their own processes
 
