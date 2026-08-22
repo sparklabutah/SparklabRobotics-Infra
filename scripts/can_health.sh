@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
-# CAN bus health check — run with the arms POWERED and the adapters plugged
-# in (ideally right after a run that threw `loss communication`).
+# CAN bus health check — run with the arms POWERED and the adapters plugged in.
 #
-# `loss communication` (motor error 0xD) is the MOTOR's own watchdog: it
-# fired because a command didn't reach it in time. That can be the wire or
-# the host, and those need opposite fixes. This tells you which:
+# `loss communication` (motor error 0xD) is the motor's own watchdog, and can be
+# the wire or the host. This says which:
 #
-#   bus-error / error-warning / error-passive / bus-off / restarts NONZERO
-#       -> PHYSICAL layer. The frames themselves are being corrupted or
-#          nacked. Check termination first (see below), then connectors,
-#          cable, stub length, ground. Retries also drag the control loop
-#          rate down, which is a second-order cause of watchdog timeouts.
-#
-#   those counters all ZERO, but motors still report loss communication
-#       -> HOST timing. The frames that went out were fine; there just
-#          weren't enough of them in time. That's GIL/CPU starvation on
-#          i2rt's polling thread (inference, checkpoint load, camera
-#          enumeration), not an electrical problem.
+#   error counters NONZERO   -> physical layer. Check termination, connectors,
+#                               cable, stub length, ground.
+#   counters ZERO            -> host timing. GIL/CPU starvation on i2rt's
+#                               polling thread, not an electrical problem.
 set -uo pipefail
 
 for i in can_left can_right; do

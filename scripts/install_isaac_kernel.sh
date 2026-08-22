@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
 # Install a self-contained Jupyter kernel for Isaac Sim + sparklab_sim.
 #
-# WHY THIS EXISTS
-# Isaac ships `jupyter_notebook.sh`, which sources setup_python_env.sh and THEN
-# launches Jupyter, so the kernel inherits LD_LIBRARY_PATH/PYTHONPATH from that
-# shell. Its installed kernelspec sets only ISAAC_JUPYTER_KERNEL=1.
+# Isaac's own kernelspec relies on the environment `jupyter_notebook.sh` sets up
+# before launching, so a client that starts kernels itself — VS Code — gets
+# "No module named 'isaacsim'". This bakes the resolved environment plus this
+# repo's src/ into kernel.json so the kernel stands alone.
 #
-# VS Code (and any other client) launches kernels itself, with no such shell in
-# the picture — so that kernelspec dies with "No module named 'isaacsim'".
-# This bakes the resolved environment into kernel.json, plus this repo's src/,
-# so the kernel stands alone.
-#
-# Re-run after moving or upgrading Isaac Sim, or after moving the repo: every
-# path baked in here is absolute.
+# Re-run after moving or upgrading Isaac, or moving the repo: every path baked
+# in here is absolute.
 #
 #   ./scripts/install_isaac_kernel.sh [/path/to/isaac-sim-standalone-...]
 
@@ -31,12 +26,11 @@ KERNEL_NAME="sparklab-isaac"
 export PY="$ISAAC/kit/python/bin/python3"
 [[ -x "$PY" ]] || { echo "ERROR: no bundled python at $PY" >&2; exit 1; }
 
-# Resolve the environment exactly as Isaac's own launcher does, in a subshell,
-# rather than reimplementing its (long, version-specific) path lists here.
+# Resolved in a subshell exactly as Isaac's launcher does, rather than
+# reimplementing its long, version-specific path lists.
 eval "$(
-    # setup_python_env.sh appends to these, so they must exist. `set -u` is
-    # deliberately dropped inside this subshell only: it is NVIDIA's script,
-    # and it assumes a normal interactive shell where both are already set.
+    # setup_python_env.sh appends to these and assumes an interactive shell
+    # where both exist, so `set -u` is dropped in this subshell only.
     set +u
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" PYTHONPATH="${PYTHONPATH:-}"
     export CARB_APP_PATH="$ISAAC/kit" ISAAC_PATH="$ISAAC" EXP_PATH="$ISAAC/apps"

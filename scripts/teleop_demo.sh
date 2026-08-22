@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Launch the YAM-Ultra teleop stack in one terminal:
-#   1. relay (TLS, reused if one is already listening on :8443)
-#   2. the bimanual hardware bridge (foreground; its log is your console)
+# Launch the YAM-Ultra teleop stack in one terminal: the relay (TLS, reused if
+# one is already on :8443), then the bimanual bridge in the foreground.
 #
-# Runs in whatever environment is active — activate the one holding this
-# package first (conda activate robot-py312); the check below fails fast if not.
+# Activate the environment holding this package first (conda activate
+# robot-py312); the check below fails fast if not.
 #
-# Usage:
 #   ./scripts/teleop_demo.sh [args forwarded to teleop_bimanual.py]
 #   ./scripts/teleop_demo.sh --sim              # no hardware dry-run
 #   ./scripts/teleop_demo.sh --left-channel can_right --right-channel can_left
 #
-# Ctrl-C stops the bridge (it ramps the arms home first), then tears down the
+# Ctrl-C stops the bridge, ramping the arms home first, then tears down the
 # relay if this script started it. A second Ctrl-C skips the ramp.
 set -euo pipefail
 
@@ -55,11 +53,8 @@ else
     curl -sk --max-time 2 -o /dev/null https://127.0.0.1:8443/ \
         || { echo "[run] relay failed to start — see $LOG_DIR/relay.log"; exit 1; }
 fi
-# Which address to point the headset at. Prefer a PRIVATE lab-LAN address over
-# the campus one: since 2026-08-12 the campus network drops inbound from other
-# subnets, so a headset on WiFi cannot reach the campus address at all -- the
-# lab router is the only path that works. `hostname -I` ordering is not stable
-# enough to rely on. Override with LAN_IP=... if the guess is wrong.
+# Prefer a private lab-LAN address: the campus network drops inbound from other
+# subnets, so only the lab router reaches the headset. Override with LAN_IP=.
 pick_lan_ip() {
     if [ -n "${LAN_IP:-}" ]; then echo "$LAN_IP"; return; fi
     local addrs private
@@ -80,8 +75,7 @@ echo "[run] Quest browser → https://$LAN_IP:8443/"
 # To watch the arms, run Isaac's live viewport separately (works over SSH):
 #     ./scripts/isaac_python.sh -m sparklab_sim.live   ->  http://127.0.0.1:8080/
 
-# ---- bridge (foreground — Ctrl-C goes straight to it; it ramps the arms
-# home before exiting, and a second Ctrl-C skips that ramp) -------------------
+# ---- bridge (foreground; Ctrl-C ramps the arms home, twice skips it) --------
 echo "[run] starting bimanual bridge — B/Y arms/disarms, Ctrl-C exits"
 rc=0
 python "$PKG/robots/yam_ultra/teleop_bimanual.py" --ws-url "$WS_URL" "$@" || rc=$?

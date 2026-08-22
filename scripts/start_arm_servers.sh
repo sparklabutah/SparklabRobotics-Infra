@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
-# Start one arm_server process per arm. Run this BEFORE record.sh /
-# rollout.sh / anything that uses --robot.type=yam_ultra_bimanual on real
-# hardware — the follower connects to these servers, it does not start them.
+# Start one arm_server process per arm. Run BEFORE record.sh / rollout.sh /
+# anything using --robot.type=yam_ultra_bimanual on real hardware — the follower
+# connects to these servers, it does not start them. See DESIGN.md for why the
+# arms live in their own processes.
 #
-# Why the arms live in their own processes: i2rt's CAN polling thread has to
-# keep sending inside each motor's watchdog window, and in-process it shared
-# a GIL with policy inference and checkpoint loading, which starved it into
-# `loss communication` while every SocketCAN fault counter read zero (see
-# scripts/can_health.sh and robots/yam_ultra/arm_server.py).
-#
-# These processes OWN TORQUE. They park the arms home on Ctrl-C / SIGTERM,
-# so stopping them is safe — but leave them running between runs rather
-# than restarting per run: each start re-homes the gripper and recaptures
-# the home pose.
+# These processes OWN TORQUE. They park the arms home on Ctrl-C / SIGTERM, so
+# stopping them is safe — but leave them running between runs, since each start
+# re-homes the gripper and recaptures the home pose.
 #
 #   ./scripts/start_arm_servers.sh              # real hardware, foreground
 #   ./scripts/start_arm_servers.sh --sim        # i2rt SimRobots, nothing moves

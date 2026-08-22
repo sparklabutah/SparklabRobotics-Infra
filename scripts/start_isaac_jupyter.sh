@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# Start a Jupyter server running Isaac Sim's bundled Python, for VS Code's
+# Start a Jupyter server on Isaac Sim's bundled Python, for VS Code's
 # "Existing Jupyter Server..." connection.
 #
-# Use this when VS Code won't offer the kernelspec directly and asks for a
-# server URL instead. The server inherits the correct environment from
-# Isaac's own launcher, so its kernels work even where a bare kernelspec
-# doesn't.
-#
-# Prints a http://localhost:<port>/?token=... URL. Paste that into
-#   Select Kernel -> Existing Jupyter Server...
-# VS Code's Remote-SSH session already tunnels localhost, so no -L forward.
+# Use this when VS Code won't offer the kernelspec directly. The server inherits
+# its environment from Isaac's own launcher, so its kernels work where a bare
+# kernelspec doesn't. Paste the printed URL into
+# Select Kernel -> Existing Jupyter Server... — Remote-SSH already tunnels
+# localhost, so no -L forward is needed.
 #
 #   ./scripts/start_isaac_jupyter.sh [port] [/path/to/isaac-sim-standalone-...]
 
@@ -22,9 +19,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ -x "$ISAAC/jupyter_notebook.sh" ]] || {
     echo "ERROR: no jupyter_notebook.sh under $ISAAC" >&2; exit 1; }
 
-# Put the repo on PYTHONPATH before Isaac's setup script runs — it *appends*
-# to PYTHONPATH, so anything exported here survives and `import sparklab_sim`
-# works in every kernel this server spawns.
+# Before Isaac's setup script, which appends to PYTHONPATH — so this survives
+# into every kernel the server spawns.
 export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "repo on PYTHONPATH : $REPO/src"
