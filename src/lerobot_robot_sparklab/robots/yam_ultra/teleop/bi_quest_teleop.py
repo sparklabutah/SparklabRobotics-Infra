@@ -10,12 +10,11 @@ get_action() returns {left,right}_joint_{1..6}.pos (rad) and
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import numpy as np
 
@@ -27,17 +26,11 @@ except ImportError as e:  # pragma: no cover
         "Run from a project environment with lerobot installed."
     ) from e
 
-try:
-    import websockets
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "websockets is required to use BiQuestTeleoperator. "
-        "Install with: uv add websockets   (or pip install websockets)"
-    ) from e
-
 from ....core.pose_mapping import ClutchPoseMapper
+from ....quest import XRFrameClient, buttons as xr_buttons
 from ..model.kinematics import DEFAULT_Q_REST
 from ..ik.decoupled_ik import DecoupledIKSolver
+from .haptics import ForceHaptics
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +38,8 @@ logger = logging.getLogger(__name__)
 # Default rotation taking Quest `local-floor` world axes into the arm base
 DEFAULT_R_CALIB = [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
 
-# WebXR xr-standard mapping: 0=trigger, 1=squeeze, 3=thumbstick, 4=A/X, 5=B/Y.
-GRIP_BUTTON_INDEX = 1  # clutch
-TRIGGER_BUTTON_INDEX = 0  # analog 0..1: gripper closure
-PRECISION_BUTTON_INDEX = 4  # A/X — hold for precision scale
-HANDOFF_BUTTON_INDEX = 5  # B/Y — intervention handoff
-REST_RAMP_BUTTON_INDEX = 3  # thumbstick click — per-arm go-home ramp
 ARM_DOFS = 6
 NQ = 8  # arm (6) + 2 gripper-finger sliders
-
-# Beyond this gap the controller stream is stale: force-disengage and refuse new
-# engagements, so a WS that stalls then floods cannot cause catch-up motion.
-XR_FRAME_STALE_TIMEOUT_S = 0.2
 
 # Gripper prismatic range from the URDF; both fingers share this qpos scale.
 GRIPPER_QPOS_OPEN = 0.001
@@ -116,17 +99,38 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     # Go-home ramp: lerp qpos[:6] to rest_qpos_{hand} over this window.
     rest_ramp_duration_s: float = 2.0
 
-    # Both act only with both hands disengaged; the resync additionally only
-    # while nothing is calling get_action(). None disables either.
-    idle_resync_interval_s: float | None = 1.0
-    auto_stow_idle_s: float | None = None
+
+
+class ArmState(TypedDict):
+    solver: DecoupledIKSolver
+    mapper: ClutchPoseMapper
+    qpos: np.ndarray
+    last_grip: bool
+    last_precision: bool
+    trigger: float
+    engaged: bool
+    haptic: float
+    force_haptic: float
+    needs_reanchor: bool
+    pos_filt: np.ndarray | None
+    quat_filt: np.ndarray | None
+    last_rest_button: bool
+    ramp_active: bool
+    ramp_start_q: np.ndarray
+    ramp_target_q: np.ndarray
+    ramp_start_t: float
+    logged_button_layout: bool
 
 
 class BiQuestTeleoperator(Teleoperator):
     config_class = BiQuestTeleoperatorConfig
     name = "bi_quest_teleop"
 
-    def __init__(self, config: BiQuestTeleoperatorConfig) -> None:
+    def __init__(
+        self,
+        config: BiQuestTeleoperatorConfig,
+        hands: tuple[str, ...] = ("left", "right"),
+    ) -> None:
         super().__init__(config)
         self.config = config
 
@@ -136,12 +140,11 @@ class BiQuestTeleoperator(Teleoperator):
                 f"r_calib must be a 3x3 rotation matrix, got shape {self._r_calib.shape}"
             )
 
+        if not hands or any(hand not in ("left", "right") for hand in hands):
+            raise ValueError(f"hands must contain left and/or right, got {hands!r}")
+        self._hands = tuple(dict.fromkeys(hands))
         self._lock = threading.RLock()
         self._latest_xr_frame: dict | None = None
-        self._stow_follower = None
-        self._idle_since: float | None = None       # monotonic ts both hands went disengaged
-        self._last_idle_resync_t: float = 0.0
-        self._auto_stowed_this_idle: bool = False    # avoid re-parking every tick while still idle
         self._last_xr_frame_time: float = 0.0
 
         rest_qpos = {
@@ -152,8 +155,8 @@ class BiQuestTeleoperator(Teleoperator):
             if q.shape != (ARM_DOFS,):
                 raise ValueError(f"rest_qpos_{hand} must have {ARM_DOFS} values, got shape {q.shape}")
 
-        self._arms: dict[str, dict] = {}
-        for hand in ("left", "right"):
+        self._arms: dict[str, ArmState] = {}
+        for hand in self._hands:
             q_rest = rest_qpos[hand]
             qpos_init = np.zeros(NQ)
             qpos_init[:ARM_DOFS] = q_rest
@@ -185,10 +188,7 @@ class BiQuestTeleoperator(Teleoperator):
                 "trigger": 0.0,
                 "engaged": False,
                 "haptic": 0.0,  # smoothed 0..1, broadcast in ik_state
-                "force_haptic": 0.0,  
-                "prev_gripper_pos": None,
-                "prev_gripper_t": None,
-                "gripper_vel_filt": 0.0,
+                "force_haptic": 0.0,
                 "needs_reanchor": False,  # set during stale → re-anchor on recovery
                 "pos_filt": None,  # EMA-smoothed controller position
                 "quat_filt": None,  # EMA-smoothed controller orientation (wxyz)
@@ -197,25 +197,16 @@ class BiQuestTeleoperator(Teleoperator):
                 "ramp_start_q": np.zeros(ARM_DOFS),
                 "ramp_target_q": q_rest.copy(),
                 "ramp_start_t": 0.0,
+                "logged_button_layout": False,
             }
         self._buttons: dict[str, dict[str, bool]] = {
-            "left": {"grip": False, "handoff": False},
-            "right": {"grip": False, "handoff": False},
+            hand: {"grip": False, "handoff": False} for hand in self._hands
         }
+        self._relay = XRFrameClient(
+            config.ws_url, name="quest-teleop-relay", on_message=self._on_relay_message
+        )
 
-        # WS plumbing.
-        self._ws_thread: threading.Thread | None = None
-        self._ws_loop: asyncio.AbstractEventLoop | None = None
-        self._ws_stop: threading.Event | None = None
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._ws_connected = threading.Event()
-
-        # Own timer so the resync runs even when get_action() does not — DAgger's
-        # autonomous phase would otherwise leave qpos frozen and stale at handoff.
-        self._idle_resync_thread: threading.Thread | None = None
-        self._idle_resync_stop: threading.Event | None = None
-
-        self._haptic_calib: dict | None = None
+        self._force_haptics = ForceHaptics(config, self._hands)
 
         # EMA-smoothed get_action() rate, published in ik_state so the web UI can
         # show the Δq-cap slider in honest rad/s.
@@ -227,7 +218,7 @@ class BiQuestTeleoperator(Teleoperator):
     @property
     def action_features(self) -> dict[str, type]:
         feats: dict[str, type] = {}
-        for hand in ("left", "right"):
+        for hand in self._hands:
             for j in range(1, ARM_DOFS + 1):
                 feats[f"{hand}_joint_{j}.pos"] = float
             feats[f"{hand}_gripper.pos"] = float
@@ -239,7 +230,7 @@ class BiQuestTeleoperator(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self._ws_connected.is_set()
+        return self._relay.is_connected
 
     @property
     def is_calibrated(self) -> bool:
@@ -254,48 +245,12 @@ class BiQuestTeleoperator(Teleoperator):
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
             return
-        self._ws_stop = threading.Event()
-        self._ws_thread = threading.Thread(
-            target=self._ws_thread_main, name="bi-quest-teleop-ws", daemon=True
-        )
-        self._ws_thread.start()
-        if not self._ws_connected.wait(timeout=self.config.connect_timeout_s):
-            raise RuntimeError(f"BiQuestTeleoperator: timed out connecting to {self.config.ws_url}")
+        self._relay.connect(timeout_s=self.config.connect_timeout_s)
         logger.info("BiQuestTeleoperator connected to %s", self.config.ws_url)
-
-        # Best-effort seed from the last connected follower so the first action
-        # doesn't target rest_qpos. Local import: avoids depending on Robot here.
-        from ..follower import get_last_connected_follower
-
-        follower = get_last_connected_follower()
-        if follower is not None:
-            self.seed_qpos_from_obs(follower.get_observation())
-            logger.info("BiQuestTeleoperator: seeded from %s's current pose", follower)
-            # Routes the thumbstick go-home ramp through the follower too.
-            self._stow_follower = follower
-
-        self._idle_resync_stop = threading.Event()
-        self._idle_resync_thread = threading.Thread(
-            target=self._idle_resync_loop, name="bi-quest-teleop-idle-resync", daemon=True
-        )
-        self._idle_resync_thread.start()
+        self._relay.send({"type": "request_settings"})
 
     def disconnect(self) -> None:
-        if self._idle_resync_stop is not None:
-            self._idle_resync_stop.set()
-        if self._idle_resync_thread is not None:
-            self._idle_resync_thread.join(timeout=2.0)
-        if self._ws_stop is not None:
-            self._ws_stop.set()
-        if self._ws_loop is not None and self._ws is not None:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(self._ws.close(), self._ws_loop)
-                fut.result(timeout=1.0)
-            except Exception:
-                pass
-        if self._ws_thread is not None:
-            self._ws_thread.join(timeout=2.0)
-        self._ws_connected.clear()
+        self._relay.disconnect()
         logger.debug("BiQuestTeleoperator disconnected")
 
     def send_feedback(self, feedback: dict) -> None:
@@ -312,89 +267,43 @@ class BiQuestTeleoperator(Teleoperator):
 
     def publish_state(self) -> None:
         """Force one ik_state broadcast without waiting for get_action()."""
-        if self.config.publish_ik_state and self._ws is not None and self._ws_loop is not None:
+        if self.config.publish_ik_state:
             self._publish_ik_state_async()
 
     def _apply_torque_feedback(self, torques: dict) -> None:
-        """Map gripper torque to 0..1 haptic intensity: θ_eff = θ_base + k_v·|v|.
-
-        The velocity term masks the inertial spike during fast opens and closes.
-
-        torques: `{left,right}_gripper.torque` (Nm), optionally `.pos` for the
-            numerical velocity. The first tick after connect uses θ_base.
-        """
-        ceiling = max(1e-6, float(self.config.force_haptic_max_nm))
-        kv = max(0.0, float(self.config.force_haptic_velocity_comp_nm))
-        # EMA on the velocity so the threshold doesn't judder tick to tick.
-        vel_alpha = 0.4
-        now = time.time()
+        """Update per-arm force feedback and publish completed calibration."""
         with self._lock:
-            for hand in ("left", "right"):
-                tau_key = f"{hand}_gripper.torque"
-                pos_key = f"{hand}_gripper.pos"
-                if tau_key not in torques:
-                    continue
-                tau = abs(float(torques[tau_key]))
-                arm = self._arms[hand]
-                # Numerical velocity from successive pos samples.
-                if pos_key in torques:
-                    pos = float(torques[pos_key])
-                    prev_pos = arm["prev_gripper_pos"]
-                    prev_t = arm["prev_gripper_t"]
-                    if prev_pos is not None and prev_t is not None:
-                        dt = max(now - prev_t, 1e-3)
-                        v_raw = (pos - prev_pos) / dt
-                        arm["gripper_vel_filt"] = (1.0 - vel_alpha) * arm[
-                            "gripper_vel_filt"
-                        ] + vel_alpha * v_raw
-                    arm["prev_gripper_pos"] = pos
-                    arm["prev_gripper_t"] = now
-                # Per-arm: static holding torque differs between grippers.
-                threshold_base = max(
-                    0.0, float(getattr(self.config, f"force_haptic_threshold_nm_{hand}"))
+            intensities, result = self._force_haptics.update(torques)
+            for hand, intensity in intensities.items():
+                self._arms[hand]["force_haptic"] = intensity
+        if result is not None:
+            if result["suspicious"]:
+                logger.warning(
+                    "haptic calibration found high idle torque: %s",
+                    ", ".join(result["suspicious"]),
                 )
-                threshold_eff = threshold_base + kv * abs(arm["gripper_vel_filt"])
-                # No dynamic range left — force 0 rather than saturating to max.
-                if threshold_eff >= ceiling:
-                    intensity = 0.0
-                else:
-                    span = ceiling - threshold_eff
-                    intensity = max(0.0, min(1.0, (tau - threshold_eff) / span))
-                # Still computed when disabled, so the toggle re-lights instantly.
-                if not self.config.force_haptic_enabled:
-                    intensity = 0.0
-                arm["force_haptic"] = intensity
-                # Track per-arm peak |τ| for threshold = peak + margin on close.
-                if self._haptic_calib is not None:
-                    self._haptic_calib["peak"][hand] = max(
-                        self._haptic_calib["peak"][hand], tau
-                    )
-            # After the per-hand loop, so both arms get the same final sample.
-            if self._haptic_calib is not None:
-                calib = self._haptic_calib
-                if now - calib["start_t"] >= calib["duration_s"]:
-                    self._finalize_haptic_calibration()
+            self._relay.send(result)
 
     # ---------- Intervention (handoff) hooks ----------
     # Level, not edge. Reads `self._buttons`, which the WS reader keeps fresh.
 
     def is_engaged(self) -> bool:
         with self._lock:
-            return self._buttons["left"]["grip"] or self._buttons["right"]["grip"]
+            return any(self._buttons[hand]["grip"] for hand in self._hands)
 
     def is_handoff_pressed(self) -> bool:
         with self._lock:
-            return self._buttons["left"]["handoff"] or self._buttons["right"]["handoff"]
+            return any(self._buttons[hand]["handoff"] for hand in self._hands)
 
     def is_pause_pressed(self) -> bool:
         """Right-hand B — pause/resume the policy. Level only."""
         with self._lock:
-            return self._buttons["right"]["handoff"]
+            return self._buttons.get("right", {}).get("handoff", False)
 
     def is_reverse_pressed(self) -> bool:
         """Left-hand Y — reverse, e.g. replay buffered actions backward. Level only."""
         with self._lock:
-            return self._buttons["left"]["handoff"]
+            return self._buttons.get("left", {}).get("handoff", False)
 
     def seed_qpos_from_obs(self, obs: dict[str, float]) -> None:
         """Reset qpos / gripper / engagement to match a `.pos`-keyed dict.
@@ -407,7 +316,7 @@ class BiQuestTeleoperator(Teleoperator):
             recording its blocked-open measurement. Missing keys are skipped.
         """
         with self._lock:
-            for hand in ("left", "right"):
+            for hand in self._hands:
                 arm = self._arms[hand]
                 for j in range(ARM_DOFS):
                     key = f"{hand}_joint_{j + 1}.pos"
@@ -431,75 +340,6 @@ class BiQuestTeleoperator(Teleoperator):
                 arm["quat_filt"] = None
                 arm["needs_reanchor"] = False
 
-    def _idle_resync_loop(self) -> None:
-        """Own thread: cover the phases where nothing calls get_action()."""
-        stop = self._idle_resync_stop
-        assert stop is not None
-        while not stop.is_set():
-            self._idle_resync_tick()
-            stop.wait(0.2)
-
-    def _idle_resync_tick(self) -> None:
-        """Resync qpos to the measurement, or auto-stow, once both hands are idle.
-
-        The resync runs only while get_action() is NOT being consumed; auto-stow
-        only while it IS (a ramp needs a live consumer). See DESIGN.md.
-        """
-        now = time.monotonic()
-        with self._lock:
-            both_disengaged = (
-                not self._arms["left"]["engaged"] and not self._arms["right"]["engaged"]
-            )
-            ramping = self._arms["left"]["ramp_active"] or self._arms["right"]["ramp_active"]
-            if not both_disengaged:
-                self._idle_since = None
-                self._auto_stowed_this_idle = False
-                return
-            if self._idle_since is None:
-                self._idle_since = now
-            idle_for = now - self._idle_since
-            last_tick_t = self._last_get_action_t
-
-        follower = self._resolve_follower()
-        if follower is None:
-            return  # pure-sim / no robot connected — nothing to resync against
-        driven = last_tick_t is not None and (time.perf_counter() - last_tick_t) < 1.0
-
-        auto_stow_s = self.config.auto_stow_idle_s
-        if (
-            driven
-            and auto_stow_s is not None
-            and idle_for >= auto_stow_s
-            and not self._auto_stowed_this_idle
-        ):
-            self._auto_stowed_this_idle = True
-            logger.info("idle %.1fs with both arms disengaged — auto-stowing", idle_for)
-            with self._lock:
-                for hand in ("left", "right"):
-                    arm = self._arms[hand]
-                    self._stow_arm(hand, arm, arm["pos_filt"], arm["quat_filt"])
-            return
-
-        interval = self.config.idle_resync_interval_s
-        if driven or ramping or not interval or now - self._last_idle_resync_t < interval:
-            return
-        self._last_idle_resync_t = now
-        try:
-            obs = follower.get_observation()  # RPC deliberately outside the lock
-        except Exception:
-            logger.exception("idle resync failed")
-            return
-        with self._lock:
-            for hand in ("left", "right"):
-                arm = self._arms[hand]
-                # Re-checked post-RPC: the operator may have engaged meanwhile.
-                if arm["engaged"] or arm["ramp_active"]:
-                    continue
-                for j in range(ARM_DOFS):
-                    key = f"{hand}_joint_{j + 1}.pos"
-                    if key in obs:
-                        arm["qpos"][j] = float(obs[key])
-
     def get_action(self) -> dict[str, float]:
         now = time.perf_counter()
         last = self._last_get_action_t
@@ -517,12 +357,12 @@ class BiQuestTeleoperator(Teleoperator):
 
             gap_s = time.time() - last_frame_time
             ctrls = xr.get("controllers") or {}
-            for hand in ("left", "right"):
+            for hand in self._hands:
                 self._update_arm(hand, ctrls.get(hand), gap_s)
 
             action = self._build_action()
 
-            if self.config.publish_ik_state and self._ws is not None and self._ws_loop is not None:
+            if self.config.publish_ik_state:
                 self._publish_ik_state_async()
 
             return action
@@ -531,7 +371,7 @@ class BiQuestTeleoperator(Teleoperator):
 
     def _build_action(self) -> dict[str, float]:
         out: dict[str, float] = {}
-        for hand in ("left", "right"):
+        for hand in self._hands:
             arm = self._arms[hand]
             for j in range(ARM_DOFS):
                 out[f"{hand}_joint_{j + 1}.pos"] = float(arm["qpos"][j])
@@ -539,21 +379,7 @@ class BiQuestTeleoperator(Teleoperator):
             out[f"{hand}_gripper.pos"] = float(np.clip(arm["trigger"], 0.0, 1.0))
         return out
 
-    def _resolve_follower(self):
-        """The connected follower, resolved lazily; None if there is none."""
-        follower = self._stow_follower
-        if follower is None:
-            from ..follower import get_last_connected_follower
-
-            follower = get_last_connected_follower()
-            if follower is not None:
-                self._stow_follower = follower
-                logger.info("bound to %s on first use", follower)
-        return follower
-
-    def _stow_arm(
-        self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray
-    ) -> None:
+    def _stow_arm(self, hand: str, arm: ArmState) -> None:
         """Thumbstick STOW: ramp this arm home without blocking the loop.
 
         The ramp is advanced a step per tick by _update_arm, so the control
@@ -600,6 +426,32 @@ class BiQuestTeleoperator(Teleoperator):
             j4_pos.round(3) if j4_pos is not None else "—",
         )
 
+    def _advance_ramp(
+        self,
+        hand: str,
+        arm: ArmState,
+        pos: np.ndarray,
+        quat_wxyz: np.ndarray,
+        pose_is_fresh: bool,
+    ) -> bool:
+        """Advance a stow trajectory even when the XR stream is stale."""
+        if not arm["ramp_active"]:
+            return False
+        duration = max(1e-3, float(self.config.rest_ramp_duration_s))
+        elapsed = time.perf_counter() - arm["ramp_start_t"]
+        t = min(1.0, elapsed / duration)
+        arm["qpos"][:ARM_DOFS] = arm["ramp_start_q"] + t * (
+            arm["ramp_target_q"] - arm["ramp_start_q"]
+        )
+        if t >= 1.0:
+            arm["ramp_active"] = False
+            if arm["engaged"] and pose_is_fresh:
+                self._anchor_mapper(hand, arm, pos, quat_wxyz, "RAMP-DONE")
+            elif arm["engaged"]:
+                arm["needs_reanchor"] = True
+        arm["haptic"] *= 0.6
+        return True
+
     def _update_arm(self, hand: str, ctrl: dict | None, gap_s: float) -> None:
         if ctrl is None:
             return
@@ -616,35 +468,31 @@ class BiQuestTeleoperator(Teleoperator):
             logger.info(
                 "%s controller reports %d buttons (stow triggers on index %d [thumbstick] "
                 "or %d [B/Y], grip is index %d; currently pressed: %s)",
-                hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX, GRIP_BUTTON_INDEX,
+                hand, len(buttons), xr_buttons.THUMBSTICK, xr_buttons.B_Y, xr_buttons.GRIP,
                 pressed_idx or "none")
-            if len(buttons) <= REST_RAMP_BUTTON_INDEX:
-                if len(buttons) > HANDOFF_BUTTON_INDEX:
+            if len(buttons) <= xr_buttons.THUMBSTICK:
+                if len(buttons) > xr_buttons.B_Y:
                     logger.warning(
                         "%s controller exposes only %d buttons — no thumbstick at index %d, "
                         "so stow falls back to B/Y on this hand and will also toggle "
                         "the bridge's ARMED state.",
-                        hand, len(buttons), REST_RAMP_BUTTON_INDEX)
+                        hand, len(buttons), xr_buttons.THUMBSTICK)
                 else:
                     logger.warning(
                         "%s controller exposes only %d buttons — neither stow index (%d, %d) "
                         "is in range, so stow can never trigger on this hand.",
-                        hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX)
+                        hand, len(buttons), xr_buttons.THUMBSTICK, xr_buttons.B_Y)
 
-        thumb_pressed = (
-            bool(buttons[REST_RAMP_BUTTON_INDEX]["p"]) if len(buttons) > REST_RAMP_BUTTON_INDEX else False
-        )
-        handoff_pressed = (
-            bool(buttons[HANDOFF_BUTTON_INDEX]["p"]) if len(buttons) > HANDOFF_BUTTON_INDEX else False
-        )
-        
+        thumb_pressed = xr_buttons.pressed(buttons, xr_buttons.THUMBSTICK)
+        handoff_pressed = xr_buttons.pressed(buttons, xr_buttons.B_Y)
+
         # B/Y belongs to the bridge: it toggles ARMED, and is_handoff_pressed()
         # ORs the two hands, so the bridge cannot tell which one pressed. Wiring
         # stow to B/Y as well meant one press did both jobs - the first hand
         # armed and stowed, the second hand's press toggled the bridge straight
         # back to DISARMED, and only the first arm ever moved. Stow is the
         # thumbstick; B/Y is only a fallback for a controller that has none.
-        has_thumbstick = len(buttons) > REST_RAMP_BUTTON_INDEX
+        has_thumbstick = len(buttons) > xr_buttons.THUMBSTICK
         rest_btn = thumb_pressed if has_thumbstick else handoff_pressed
         if rest_btn and not arm["last_rest_button"] and not arm["ramp_active"]:
             # Always announce: silence here means the index is wrong, which is a
@@ -658,14 +506,18 @@ class BiQuestTeleoperator(Teleoperator):
             # the powered-up pose, and it does not block: the old follower.park()
             # branch held the control loop for the whole ramp, so two arms could
             # never stow at the same time and the second press went unseen.
-            self._stow_arm(hand, arm, pos_raw, quat_raw)
+            self._stow_arm(hand, arm)
             return
         else:
             arm["last_rest_button"] = rest_btn
 
+        pose_is_fresh = gap_s <= xr_buttons.XR_FRAME_STALE_TIMEOUT_S
+        if self._advance_ramp(hand, arm, pos_raw, quat_raw, pose_is_fresh):
+            return
+
         # Stale pose: skip engage/disengage/IK and flag a re-anchor, so the
         # engage-delta restarts at zero and there is no catch-up motion.
-        if gap_s > XR_FRAME_STALE_TIMEOUT_S:
+        if gap_s > xr_buttons.XR_FRAME_STALE_TIMEOUT_S:
             if arm["engaged"] and not arm["needs_reanchor"]:
                 arm["needs_reanchor"] = True
                 logger.warning("%s xr_frame stale (%.2fs gap) — pausing", hand, gap_s)
@@ -686,11 +538,9 @@ class BiQuestTeleoperator(Teleoperator):
         pos = arm["pos_filt"]
         quat_wxyz = arm["quat_filt"]
 
-        grip = bool(buttons[GRIP_BUTTON_INDEX]["p"]) if len(buttons) > GRIP_BUTTON_INDEX else False
-        trigger = float(buttons[TRIGGER_BUTTON_INDEX]["v"]) if len(buttons) > TRIGGER_BUTTON_INDEX else 0.0
-        precision = (
-            bool(buttons[PRECISION_BUTTON_INDEX]["p"]) if len(buttons) > PRECISION_BUTTON_INDEX else False
-        )
+        grip = xr_buttons.pressed(buttons, xr_buttons.GRIP)
+        trigger = xr_buttons.value(buttons, xr_buttons.TRIGGER)
+        precision = xr_buttons.pressed(buttons, xr_buttons.A_X)
         # Precision scales the mapper gains down; re-anchor on either edge so the
         # accumulated delta is not reinterpreted under the new scale.
         if precision != arm["last_precision"] and arm["engaged"]:
@@ -730,23 +580,6 @@ class BiQuestTeleoperator(Teleoperator):
             arm["qpos"][6] = grip_qpos
             arm["qpos"][7] = grip_qpos
 
-        # The ramp owns qpos[:6] while active; IK is skipped so the mapper delta
-        # doesn't fight the interpolation. The gripper still tracks the trigger.
-        if arm["ramp_active"]:
-            duration = max(1e-3, float(self.config.rest_ramp_duration_s))
-            elapsed = time.perf_counter() - arm["ramp_start_t"]
-            t = min(1.0, elapsed / duration)
-            arm["qpos"][:ARM_DOFS] = arm["ramp_start_q"] + t * (arm["ramp_target_q"] - arm["ramp_start_q"])
-            if t >= 1.0:
-                arm["ramp_active"] = False
-                if arm["engaged"]:
-                    # Re-anchor at the rest EE so the first IK tick doesn't jump.
-                    self._anchor_mapper(hand, arm, pos, quat_wxyz, "RAMP-DONE")
-                else:
-                    logger.debug("%s rest-ramp DONE (disengaged)", hand)
-            arm["haptic"] *= 0.6  # decay haptic during the ramp
-            return
-
         # FK at the last commanded qpos; feeds the mapper's reach limits.
         ee_pos_now, ee_quat_now = arm["solver"].fk(arm["qpos"])
         out = arm["mapper"].target(pos, quat_wxyz, ee_pos_now, ee_quat_now)
@@ -770,41 +603,35 @@ class BiQuestTeleoperator(Teleoperator):
             arm["haptic"] *= 0.6  # decay so vibration doesn't linger after release
 
     def _publish_ik_state_async(self) -> None:
-        """Schedule an ik_state send: called on the LeRobot thread, run on the WS thread."""
+        """Queue an ``ik_state`` message on the shared relay client."""
+        def state(hand: str) -> tuple[list[float], bool, float, float]:
+            arm = self._arms.get(hand)
+            if arm is None:
+                return [0.0] * NQ, False, 0.0, 0.0
+            return (
+                [float(v) for v in arm["qpos"][:NQ]],
+                bool(arm["engaged"]),
+                float(arm["haptic"]),
+                float(arm["force_haptic"]),
+            )
+
+        left_q, left_engaged, left_haptic, left_force = state("left")
+        right_q, right_engaged, right_haptic, right_force = state("right")
         payload = {
             "type": "ik_state",
-            "left_qpos": [float(v) for v in self._arms["left"]["qpos"][:NQ]],
-            "right_qpos": [float(v) for v in self._arms["right"]["qpos"][:NQ]],
-            "left_engaged": bool(self._arms["left"]["engaged"]),
-            "right_engaged": bool(self._arms["right"]["engaged"]),
-            # EMA'd max of the IK trouble signals; vibrates the matching controller.
-            "left_haptic": float(self._arms["left"]["haptic"]),
-            "right_haptic": float(self._arms["right"]["haptic"]),
-            # From `send_feedback`'s gripper torque; mixed with `*_haptic` client-side.
-            "left_force_haptic": float(self._arms["left"]["force_haptic"]),
-            "right_force_haptic": float(self._arms["right"]["force_haptic"]),
-            # Compat shim: the Quest UI still reads single-arm `qpos`.
-            "qpos": [float(v) for v in self._arms["right"]["qpos"][:NQ]],
-            "engaged": bool(self._arms["right"]["engaged"]),
-            # Lets passive listeners pick one stream when several teleops share a relay.
+            "left_qpos": left_q,
+            "right_qpos": right_q,
+            "left_engaged": left_engaged,
+            "right_engaged": right_engaged,
+            "left_haptic": left_haptic,
+            "right_haptic": right_haptic,
+            "left_force_haptic": left_force,
+            "right_force_haptic": right_force,
             "teleop_id": str(self.config.id) if self.config.id is not None else None,
             "server_time": time.time(),
-            # 0.0 until the second call; the UI treats <1 Hz as unknown.
             "loop_hz": float(self._loop_hz or 0.0),
         }
-        text = json.dumps(payload)
-
-        async def _send():
-            try:
-                if self._ws is not None:
-                    await self._ws.send(text)
-            except Exception:
-                pass
-
-        try:
-            asyncio.run_coroutine_threadsafe(_send(), self._ws_loop)
-        except Exception:
-            pass
+        self._relay.send(payload)
 
     # ---------- Live config (from the web UI) ----------
 
@@ -864,10 +691,10 @@ class BiQuestTeleoperator(Teleoperator):
                 rot = float(self.config.max_dq_per_joint_scalar_rot)
                 arr = [pos] * 3 + [rot] * 3
                 self.config.max_dq_per_joint = arr
-                for hand in ("left", "right"):
-                    solver = self._arms[hand].get("solver")
-                    if solver is not None:
-                        solver.max_dq_per_joint = np.asarray(arr, dtype=float).copy()
+                for hand in self._hands:
+                    self._arms[hand]["solver"].max_dq_per_joint = np.asarray(
+                        arr, dtype=float
+                    ).copy()
             for key in self._LIVE_CONFIG_BOOLS:
                 if key not in cfg:
                     continue
@@ -880,195 +707,29 @@ class BiQuestTeleoperator(Teleoperator):
                 ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in applied.items()),
             )
 
-    # ---------- Haptic-threshold calibration (web UI button) ----------
-
-    # Margin over the observed idle peak: a short sample misses the session tail.
-    # 0.20 silences idle buzz without eating the contact range (>0.5 Nm here).
-    _HAPTIC_CALIB_MARGIN_NM: float = 0.20
-    # Ceiling on auto-written thresholds, so a faulty gripper can't silence the
-    # haptic entirely. Matches the _LIVE_CONFIG_BOUNDS upper bound.
-    _HAPTIC_CALIB_MAX_THRESHOLD_NM: float = 1.0
-    # Minimum (max − threshold) span kept after calibration, so the deadband
-    # always has room to ramp instead of saturating every grasp to max.
-    _HAPTIC_CALIB_MIN_SPAN_NM: float = 0.50
-    # Peak above this hints at a hardware fault; calibration warns rather than
-    # letting the operator trust the result.
-    _HAPTIC_CALIB_SUSPICIOUS_PEAK_NM: float = 0.50
-
-    def _start_haptic_calibration(self, duration_s: float = 5.0) -> None:
-        """Begin a per-arm idle-torque sampling window.
-
-        duration_s: window length in seconds, clamped to [0.5, 10.0].
-        """
-        duration_s = max(0.5, min(10.0, float(duration_s)))
+    def _start_haptic_calibration(self, duration_s: float) -> None:
         with self._lock:
-            if self._haptic_calib is not None:
-                logger.info("haptic_calibrate: already running; ignoring duplicate start")
-                return
-            self._haptic_calib = {
-                "start_t": time.time(),
-                "duration_s": duration_s,
-                "peak": {"left": 0.0, "right": 0.0},
-            }
-        logger.info("haptic_calibrate: starting %.1fs idle-torque sampling", duration_s)
+            started = self._force_haptics.start_calibration(duration_s)
+        if not started:
+            logger.info("haptic calibration is already running")
 
-    def _finalize_haptic_calibration(self) -> None:
-        """Close the calibration window, write thresholds, emit the result message.
-
-        Must be called with `self._lock` held.
-        """
-        calib = self._haptic_calib
-        if calib is None:
-            return
-        margin = self._HAPTIC_CALIB_MARGIN_NM
-        threshold_cap = self._HAPTIC_CALIB_MAX_THRESHOLD_NM
-        peaks = calib["peak"]
-        new = {hand: min(threshold_cap, peaks[hand] + margin) for hand in ("left", "right")}
-        self.config.force_haptic_threshold_nm_left = new["left"]
-        self.config.force_haptic_threshold_nm_right = new["right"]
-
-        # Keep the span ≥ MIN_SPAN_NM so grasps stay unsaturated. Raise only.
-        required_max = max(new["left"], new["right"]) + self._HAPTIC_CALIB_MIN_SPAN_NM
-        old_max = float(self.config.force_haptic_max_nm)
-        new_max = max(old_max, required_max)
-        if new_max != old_max:
-            self.config.force_haptic_max_nm = new_max
-
-        # Still written, so the operator isn't stuck with constant buzz, but flagged.
-        suspicious = []
-        for hand in ("left", "right"):
-            if peaks[hand] > self._HAPTIC_CALIB_SUSPICIOUS_PEAK_NM:
-                suspicious.append(f"{hand} peak={peaks[hand]:.3f} Nm")
-        if suspicious:
-            logger.warning(
-                "haptic_calibrate: suspicious idle peak(s) — %s. "
-                "Expected <%.2f Nm at rest with empty jaws; check the gripper "
-                "isn't jammed, the cable isn't fouled on the frame, and the "
-                "command isn't holding closed against a stop.",
-                ", ".join(suspicious), self._HAPTIC_CALIB_SUSPICIOUS_PEAK_NM,
-            )
-
-        self._haptic_calib = None
-        logger.info(
-            "haptic_calibrate done: peak L=%.3f R=%.3f → threshold L=%.3f R=%.3f Nm "
-            "(margin=%.2f, force_haptic_max_nm=%.2f)",
-            peaks["left"], peaks["right"], new["left"], new["right"], margin, new_max,
-        )
-        # Broadcast back to the web client so it can display the new values.
-        # Fire-and-forget on the WS loop so we don't block under the lock.
-        payload = {
-            "type": "haptic_calibrate_result",
-            "left_peak_nm": float(peaks["left"]),
-            "right_peak_nm": float(peaks["right"]),
-            "left_threshold_nm": float(new["left"]),
-            "right_threshold_nm": float(new["right"]),
-            "margin_nm": float(margin),
-            "max_nm": float(new_max),
-            "suspicious": suspicious,
-        }
-        text = json.dumps(payload)
-
-        async def _send() -> None:
-            try:
-                if self._ws is not None:
-                    await self._ws.send(text)
-            except Exception:
-                pass
-
-        if self._ws_loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(_send(), self._ws_loop)
-            except Exception:
-                pass
-
-    # ---------- WS thread ----------
-
-    def _ws_thread_main(self) -> None:
-        loop = asyncio.new_event_loop()
-        self._ws_loop = loop
-        try:
-            loop.run_until_complete(self._ws_runner())
-        finally:
-            loop.close()
-            self._ws_loop = None
-
-    def _ssl_context_for(self, url: str):
-        """Build an SSL context for `wss://` URLs, or None for `ws://`.
-
-        Validation is skipped for a local relay, whose self-signed cert would
-        otherwise be rejected; remote targets use the default trust store.
-
-        url: the websocket URL being connected to.
-        """
-        if not url.startswith("wss://"):
-            return None
-        import ssl
-
-        ctx = ssl.create_default_context()
-        if "://localhost" in url or "://127.0.0.1" in url:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-
-    async def _ws_runner(self) -> None:
-        backoff = 1.0
-        ssl_ctx = self._ssl_context_for(self.config.ws_url)
-        while not self._ws_stop.is_set():
-            try:
-                async with websockets.connect(self.config.ws_url, ssl=ssl_ctx) as ws:
-                    self._ws = ws
-                    self._ws_connected.set()
-                    backoff = 1.0
-                    # Ask the page to re-broadcast its sliders so the session doesn't
-                    # start on stale dataclass defaults. No-op if no page is connected.
-                    try:
-                        await ws.send(json.dumps({"type": "request_settings"}))
-                    except Exception as e:
-                        logger.debug("request_settings send failed: %s", e)
-                    async for raw in ws:
-                        if self._ws_stop.is_set():
-                            break
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-                        mtype = msg.get("type")
-                        if mtype == "xr_frame":
-                            # Extracted here so the DAgger listener stays live even
-                            # when get_action(), and thus the IK pipeline, isn't.
-                            btn_snapshot = {
-                                "left": {"grip": False, "handoff": False},
-                                "right": {"grip": False, "handoff": False},
-                            }
-                            ctrls = msg.get("controllers") or {}
-                            for hand in ("left", "right"):
-                                ctrl = ctrls.get(hand) or {}
-                                buttons = ctrl.get("buttons") or []
-                                if len(buttons) > GRIP_BUTTON_INDEX:
-                                    btn_snapshot[hand]["grip"] = bool(buttons[GRIP_BUTTON_INDEX].get("p"))
-                                if len(buttons) > HANDOFF_BUTTON_INDEX:
-                                    btn_snapshot[hand]["handoff"] = bool(
-                                        buttons[HANDOFF_BUTTON_INDEX].get("p")
-                                    )
-                            with self._lock:
-                                self._latest_xr_frame = msg
-                                self._last_xr_frame_time = time.time()
-                                self._buttons = btn_snapshot
-                        elif mtype == "config_update":
-                            self._apply_config_update(msg.get("config") or {})
-                        elif mtype == "haptic_calibrate":
-                            self._start_haptic_calibration(
-                                float(msg.get("duration_s") or 5.0)
-                            )
-                        # else: ignore (our own echoed ik_state, pings, etc.)
-            except Exception as e:
-                logger.warning(
-                    "BiQuestTeleoperator WS error (%s); reconnecting in %.1fs", type(e).__name__, backoff
-                )
-            finally:
-                self._ws = None
-                self._ws_connected.clear()
-            if self._ws_stop.is_set():
-                break
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 10.0)
+    def _on_relay_message(self, msg: dict) -> None:
+        """Dispatch non-transport relay messages on the relay thread."""
+        mtype = msg.get("type")
+        if mtype == "xr_frame":
+            snapshot: dict[str, dict[str, bool]] = {}
+            controllers = msg.get("controllers") or {}
+            for hand in self._hands:
+                raw_buttons = (controllers.get(hand) or {}).get("buttons") or []
+                snapshot[hand] = {
+                    "grip": xr_buttons.pressed(raw_buttons, xr_buttons.GRIP),
+                    "handoff": xr_buttons.pressed(raw_buttons, xr_buttons.B_Y),
+                }
+            with self._lock:
+                self._latest_xr_frame = msg
+                self._last_xr_frame_time = time.time()
+                self._buttons = snapshot
+        elif mtype == "config_update":
+            self._apply_config_update(msg.get("config") or {})
+        elif mtype == "haptic_calibrate":
+            self._start_haptic_calibration(float(msg.get("duration_s") or 5.0))

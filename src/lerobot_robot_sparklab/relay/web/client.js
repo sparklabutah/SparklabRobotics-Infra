@@ -1,3 +1,13 @@
+import {
+  mat4FromPosQuat,
+  mat4Mul,
+  openXRSession,
+  rotateVecByQuat,
+  xyz,
+  xyzw,
+} from "./xr-support.js";
+import { quatToMat3, solvePivot } from "./pivot-calibration.js";
+
 (() => {
   const $ = (id) => document.getElementById(id);
   // Live tick rate of get_action() in the teleop process. Populated from
@@ -121,123 +131,11 @@
   // produce ~zero translation, so the IK doesn't see ghost translation on
   // wrist twists. Default value below is a reasonable hand-tuned starting
   // point until the user runs the in-VR pivot calibration ("Calibrate wrist
-  // pivot" button). Calibration result lives in localStorage. Legacy URL
-  // override: `?offset=0.07` → applies to Z on both hands.
+  // pivot" button). Calibration result lives in localStorage.
   const STORAGE_KEY = "vrteleop:readout_offset_v1";
-  const offsetParam = parseFloat(new URL(location.href).searchParams.get("offset"));
-  const fallbackZ = Number.isFinite(offsetParam) ? offsetParam : 0.05;
+  const fallbackZ = 0.05;
   const readoutOffset = { left: [0, 0, fallbackZ], right: [0, 0, fallbackZ] };
 
-  // Quaternion (xyzw) to 3x3 rotation matrix, row-major nested arrays.
-  // Same convention as rotateVecByQuat below: R · v == rotateVecByQuat(v, q).
-  const quatToMat3 = (q) => {
-    const [x, y, z, w] = q;
-    const xx = x*x, yy = y*y, zz = z*z;
-    const xy = x*y, xz = x*z, yz = y*z;
-    const wx = w*x, wy = w*y, wz = w*z;
-    return [
-      [1 - 2*(yy + zz), 2*(xy - wz),     2*(xz + wy)],
-      [2*(xy + wz),     1 - 2*(xx + zz), 2*(yz - wx)],
-      [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)],
-    ];
-  };
-
-  // Solve M · x = v for 3-vector x via Cramer's rule. Returns {x, det}; x is
-  // null if the system is too ill-conditioned to trust.
-  const solve3x3 = (M, v) => {
-    const [m00, m01, m02] = M[0];
-    const [m10, m11, m12] = M[1];
-    const [m20, m21, m22] = M[2];
-    const det = m00*(m11*m22 - m12*m21)
-              - m01*(m10*m22 - m12*m20)
-              + m02*(m10*m21 - m11*m20);
-    const tr = Math.abs(m00) + Math.abs(m11) + Math.abs(m22);
-    if (!Number.isFinite(det) || Math.abs(det) < 1e-6 * Math.max(1, tr)**3) {
-      return { x: null, det };
-    }
-    const dx = v[0]*(m11*m22 - m12*m21) - m01*(v[1]*m22 - m12*v[2]) + m02*(v[1]*m21 - m11*v[2]);
-    const dy = m00*(v[1]*m22 - m12*v[2]) - v[0]*(m10*m22 - m12*m20) + m02*(m10*v[2] - v[1]*m20);
-    const dz = m00*(m11*v[2] - v[1]*m21) - m01*(m10*v[2] - v[1]*m20) + v[0]*(m10*m21 - m11*m20);
-    return { x: [dx/det, dy/det, dz/det], det };
-  };
-
-  // Pivot calibration: given samples of (p, R) where the wrist pivot was held
-  // still, find the local-frame offset o so that p + R·o is constant. Solves
-  //   o = -(Σ dRᵀ dR)⁻¹ (Σ dRᵀ dp)
-  // with mean-centered dR, dp. Also returns RMS residual of the recovered
-  // pivot path — small means the pivot was indeed held still.
-  const solvePivot = (samples) => {
-    const N = samples.length;
-    if (N < 30) return { ok: false, reason: `too few samples (${N})` };
-    const pbar = [0, 0, 0];
-    const Rbar = [[0,0,0],[0,0,0],[0,0,0]];
-    for (const s of samples) {
-      for (let i = 0; i < 3; i++) {
-        pbar[i] += s.p[i];
-        for (let j = 0; j < 3; j++) Rbar[i][j] += s.R[i][j];
-      }
-    }
-    for (let i = 0; i < 3; i++) {
-      pbar[i] /= N;
-      for (let j = 0; j < 3; j++) Rbar[i][j] /= N;
-    }
-    const A = [[0,0,0],[0,0,0],[0,0,0]];
-    const b = [0, 0, 0];
-    for (const s of samples) {
-      const dR = [[0,0,0],[0,0,0],[0,0,0]];
-      for (let i = 0; i < 3; i++)
-        for (let j = 0; j < 3; j++)
-          dR[i][j] = s.R[i][j] - Rbar[i][j];
-      const dp = [s.p[0]-pbar[0], s.p[1]-pbar[1], s.p[2]-pbar[2]];
-      // A += dRᵀ · dR;  b += dRᵀ · dp
-      for (let i = 0; i < 3; i++) {
-        for (let j = 0; j < 3; j++) {
-          let aij = 0;
-          for (let k = 0; k < 3; k++) aij += dR[k][i] * dR[k][j];
-          A[i][j] += aij;
-        }
-        let bi = 0;
-        for (let k = 0; k < 3; k++) bi += dR[k][i] * dp[k];
-        b[i] += bi;
-      }
-    }
-    const sol = solve3x3(A, [-b[0], -b[1], -b[2]]);
-    if (!sol.x) return { ok: false, reason: `ill-conditioned (det=${sol.det.toExponential(2)})` };
-    const o = sol.x;
-    // Residual: variance of p + R·o around its mean.
-    const pivots = samples.map(s => [
-      s.p[0] + s.R[0][0]*o[0] + s.R[0][1]*o[1] + s.R[0][2]*o[2],
-      s.p[1] + s.R[1][0]*o[0] + s.R[1][1]*o[1] + s.R[1][2]*o[2],
-      s.p[2] + s.R[2][0]*o[0] + s.R[2][1]*o[1] + s.R[2][2]*o[2],
-    ]);
-    const cm = [0, 0, 0];
-    for (const pv of pivots) for (let i = 0; i < 3; i++) cm[i] += pv[i] / N;
-    let sumSq = 0;
-    for (const pv of pivots) {
-      const dx = pv[0]-cm[0], dy = pv[1]-cm[1], dz = pv[2]-cm[2];
-      sumSq += dx*dx + dy*dy + dz*dz;
-    }
-    const rms = Math.sqrt(sumSq / N);
-    return { ok: true, o, rms, n: N };
-  };
-
-  // Rotate vector v by quaternion q (xyzw form) — standard formula:
-  //   v' = v + 2·qw·(q × v) + 2·(q × (q × v)),  q here = vector part.
-  const rotateVecByQuat = (v, q) => {
-    const [qx, qy, qz, qw] = q;
-    const [vx, vy, vz] = v;
-    const c1x = qy * vz - qz * vy;
-    const c1y = qz * vx - qx * vz;
-    const c1z = qx * vy - qy * vx;
-    const c2x = qy * c1z - qz * c1y;
-    const c2y = qz * c1x - qx * c1z;
-    const c2z = qx * c1y - qy * c1x;
-    return [
-      vx + 2 * qw * c1x + 2 * c2x,
-      vy + 2 * qw * c1y + 2 * c2y,
-      vz + 2 * qw * c1z + 2 * c2z,
-    ];
-  };
 
   // Per-arm continuous-haptic intensity (0..1). Two sources, mixed per
   // tick into the actual controller pulse:
@@ -320,7 +218,7 @@
         _latPush(rtt);            // feed the latency-mode aggregator (no-op when off)
       }
       if (data.type === "ik_state") {
-        const eng = !!data.engaged;
+        const eng = !!data.left_engaged || !!data.right_engaged;
         if (eng !== ui.engaged) { ui.engaged = eng; refreshPill(); }
         clutchEl.textContent = eng ? "ENGAGED" : "idle";
         // Per-arm haptic intensity from the IK's limit-pressure metric.
@@ -876,11 +774,7 @@
     try {
       gl = canvas.getContext("webgl2", { xrCompatible: true });
       if (!gl) throw new Error("WebGL2 unavailable");
-      xrSession = await navigator.xr.requestSession(xrMode, { optionalFeatures: ["local-floor"] });
-      xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
-      xrRefSpace = await xrSession.requestReferenceSpace("local-floor")
-        .catch(() => xrSession.requestReferenceSpace("local"));
-      xrSession.addEventListener("end", () => {
+      const opened = await openXRSession(xrMode, gl, () => {
         xrSession = null; xrRefSpace = null;
         videoGL = null; cameraAnchor = null; sessionStartWallTime = null;
         panelDrag = null; lastGripHeld.left = false; lastGripHeld.right = false;
@@ -889,6 +783,8 @@
         if (calibBtn) calibBtn.disabled = !xrMode;
         append("xr session ended");
       });
+      xrSession = opened.session;
+      xrRefSpace = opened.refSpace;
       ui.xrState = "in-session"; refreshPill();
       enterBtn.textContent = "Stop Teleop";
       append("xr session started");
@@ -980,7 +876,7 @@
       try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
       readoutOffset.left  = [0, 0, fallbackZ];
       readoutOffset.right = [0, 0, fallbackZ];
-      append(`calibration cleared. Reverted to default offset ${fallbackZ.toFixed(3)}m on Z (legacy).`);
+      append(`calibration cleared. Reverted to default offset ${fallbackZ.toFixed(3)}m on Z.`);
       setCalibStatus(false,
         `no calibration stored — using default ${(fallbackZ*100).toFixed(0)}cm Z offset`,
         "wrist not calibrated");
@@ -1002,11 +898,6 @@
       try {
         gl = canvas.getContext("webgl2", { xrCompatible: true });
         if (!gl) throw new Error("WebGL2 unavailable");
-        xrSession = await navigator.xr.requestSession(xrMode, { optionalFeatures: ["local-floor"] });
-        xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
-        xrRefSpace = await xrSession.requestReferenceSpace("local-floor")
-          .catch(() => xrSession.requestReferenceSpace("local"));
-
         calibMode = true;
         calibrating = false;
         calibBuffers.left = [];
@@ -1014,7 +905,7 @@
         calibFrameCount = 0;
         calibHandednessSeen = new Set();
 
-        xrSession.addEventListener("end", () => {
+        const opened = await openXRSession(xrMode, gl, () => {
           const wasCalibMode = calibMode;
           calibMode = false;
           calibrating = false;
@@ -1028,6 +919,8 @@
           append("xr session ended");
           if (wasCalibMode) processCalibrationResults();
         });
+        xrSession = opened.session;
+        xrRefSpace = opened.refSpace;
         ui.xrState = "calibrating"; refreshPill();
         enterBtn.textContent = "Stop Teleop";
         enterBtn.disabled = false;   // allow operator to bail out via this button
@@ -1043,9 +936,6 @@
       }
     });
   }
-
-  const xyz = (v) => [v.x, v.y, v.z];
-  const xyzw = (v) => [v.x, v.y, v.z, v.w];
 
   // ---- Debug overlay toggle ----
   // Gates the per-controller readout-point balls drawn in onXRFrame (see
@@ -1065,28 +955,6 @@
     try { localStorage.setItem(AXES_KEY, showAxes ? "1" : "0"); } catch (_) {}
   });
 
-  // Multiply two 4×4 column-major matrices (Float32Array(16)).
-  const mat4Mul = (a, b) => {
-    const o = new Float32Array(16);
-    for (let c = 0; c < 4; c++)
-      for (let r = 0; r < 4; r++) {
-        let s = 0;
-        for (let k = 0; k < 4; k++) s += a[r + k*4] * b[k + c*4];
-        o[r + c*4] = s;
-      }
-    return o;
-  };
-
-  // 4×4 column-major from position [x,y,z] and quaternion [x,y,z,w].
-  const mat4FromPosQuat = (p, q) => {
-    const [x, y, z, w] = q;
-    return new Float32Array([
-      1 - 2*(y*y + z*z), 2*(x*y + w*z),     2*(x*z - w*y),     0,
-      2*(x*y - w*z),     1 - 2*(x*x + z*z), 2*(y*z + w*x),     0,
-      2*(x*z + w*y),     2*(y*z - w*x),     1 - 2*(x*x + y*y), 0,
-      p[0],              p[1],              p[2],              1,
-    ]);
-  };
   // ---- Debug balls (controller readout-point markers) ----
   // The "show axes" debug overlay draws two balls per controller instead of
   // coordinate frames: RED at the raw WebXR gripSpace origin (the palm, where
@@ -1464,7 +1332,7 @@
       // Shift the reported readout point in the controller's local frame so
       // it lines up with the operator's wrist pivot — pure wrist twists then
       // produce ~zero translation delta. Per-hand offset is set by the
-      // calibration flow (or the legacy ?offset URL param as a fallback).
+      // calibration flow, with a fixed default until calibration is complete.
       const off = readoutOffset[src.handedness] || [0, 0, 0];
       const offsetWorld = rotateVecByQuat(off, orient);
       const posOut = [

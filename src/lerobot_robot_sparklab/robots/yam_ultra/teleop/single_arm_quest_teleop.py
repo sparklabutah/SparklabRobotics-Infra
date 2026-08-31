@@ -52,7 +52,7 @@ class SingleArmQuestTeleoperator(Teleoperator):
     def __init__(self, config: SingleArmQuestTeleoperatorConfig) -> None:
         super().__init__(config)
         self.config = config
-        self._inner = BiQuestTeleoperator(config)
+        self._inner = BiQuestTeleoperator(config, hands=(config.arm,))
         self._prefix = f"{config.arm}_"
 
     # ---------- Teleoperator interface ----------

@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cache, cached_property
 from pathlib import Path
 
 import numpy as np
@@ -29,23 +29,21 @@ from lerobot.utils.decorators import check_if_already_connected
 from lerobot.utils.errors import DeviceNotConnectedError
 
 from .arm_client import YamArmClient
+from .constants import ARM_JOINTS, DEFAULT_MAX_RELATIVE_TARGET, HANDS
 
 logger = logging.getLogger(__name__)
-
-ARM_JOINTS = 6
-HANDS = ("left", "right")
-
-# Most recently connected instance: lerobot-record offers no hook between
-# robot.connect() and teleop.connect(), so the teleop seeds itself from this.
-_LAST_CONNECTED: "YamUltraFollower | None" = None
-
-
-def get_last_connected_follower() -> "YamUltraFollower | None":
-    return _LAST_CONNECTED
 
 # Wrong path fails quietly: _default_cameras() returns {} and the follower comes
 # up with no cameras, so a policy just receives an observation without them.
 _CAMERAS_YAML = Path(__file__).parent / "config" / "cameras.yaml"
+
+
+@cache
+def _camera_config_data() -> dict:
+    if not _CAMERAS_YAML.exists():
+        logger.warning("%s not found — YamUltraFollower will have no default cameras", _CAMERAS_YAML)
+        return {}
+    return yaml.safe_load(_CAMERAS_YAML.read_text()) or {}
 
 
 def _default_cameras() -> dict[str, CameraConfig]:
@@ -55,13 +53,8 @@ def _default_cameras() -> dict[str, CameraConfig]:
     profile it really offers. Its optional ``crop_height`` is applied after
     capture in ``_read_camera()``, not here.
     """
-    if not _CAMERAS_YAML.exists():
-        logger.warning("%s not found — YamUltraFollower will have no default cameras",
-                        _CAMERAS_YAML)
-        return {}
-    data = yaml.safe_load(_CAMERAS_YAML.read_text()) or {}
     cams: dict[str, CameraConfig] = {}
-    for cam_id, cfg in (data.get("cameras") or {}).items():
+    for cam_id, cfg in (_camera_config_data().get("cameras") or {}).items():
         cams[cam_id] = RealSenseCameraConfig(
             serial_number_or_name=str(cfg["serial"]),
             width=cfg.get("width", 640),
@@ -73,11 +66,8 @@ def _default_cameras() -> dict[str, CameraConfig]:
 
 def _default_camera_crop_heights() -> dict[str, int]:
     """name -> crop_height for cameras whose yaml entry sets one."""
-    if not _CAMERAS_YAML.exists():
-        return {}
-    data = yaml.safe_load(_CAMERAS_YAML.read_text()) or {}
     return {cam_id: int(cfg["crop_height"])
-            for cam_id, cfg in (data.get("cameras") or {}).items()
+            for cam_id, cfg in (_camera_config_data().get("cameras") or {}).items()
             if "crop_height" in cfg}
 
 
@@ -111,7 +101,7 @@ class YamUltraFollowerConfig(RobotConfig):
     gripper_flip: bool = False
 
     max_relative_target: float | list[float] | None = field(
-        default_factory=lambda: [0.133, 0.133, 0.133, 0.15, 0.15, 0.15]
+        default_factory=lambda: list(DEFAULT_MAX_RELATIVE_TARGET)
     )
 
     # Ramp the arms to the zero pose on disconnect, where torque is safe to cut.
@@ -241,8 +231,6 @@ class YamUltraFollower(Robot):
             self._connected = False
             raise
 
-        global _LAST_CONNECTED
-        _LAST_CONNECTED = self
         logger.info("%s connected (%d cameras).", self, len(self.cameras))
 
     def _spawn_sim_servers(self) -> None:
@@ -441,8 +429,32 @@ class YamUltraFollower(Robot):
 
         return sent
 
-    def park(self, hands: Sequence[str] | None = None, duration_s: float | None = None,
-             rate_hz: float = 50.0) -> None:
+    def move_to(
+        self,
+        targets: dict[str, Sequence[float]],
+        duration_s: float,
+        rate_hz: float = 50.0,
+    ) -> None:
+        """Move both arms through the normal safety-clamped action path."""
+        obs = self.get_observation()
+        starts = {
+            hand: np.array([obs[key] for key in self._ARM_KEYS[hand]]) for hand in HANDS
+        }
+        grippers = {hand: float(obs[self._GRIPPER_KEYS[hand]]) for hand in HANDS}
+        steps = max(1, int(duration_s * rate_hz))
+        for i in range(steps + 1):
+            phase = i / steps
+            alpha = phase * phase * (3.0 - 2.0 * phase)
+            action: dict[str, float] = {}
+            for hand in HANDS:
+                target = np.asarray(targets.get(hand, starts[hand]), dtype=float)
+                qpos = (1.0 - alpha) * starts[hand] + alpha * target
+                action.update(zip(self._ARM_KEYS[hand], qpos.tolist()))
+                action[self._GRIPPER_KEYS[hand]] = grippers[hand]
+            self.send_action(action)
+            time.sleep(1.0 / rate_hz)
+
+    def park(self, hands: Sequence[str] | None = None, duration_s: float | None = None) -> None:
         """Ramp arms to the zero pose and hold, where torque is safe to cut.
 
         Zero rather than a pose captured at connect(), which would park a run
@@ -452,7 +464,7 @@ class YamUltraFollower(Robot):
         hands: defaults to both; pass ["left"] to stow one and leave the other
             under teleop control. Both ramps start before either is awaited.
         duration_s: ramp length; defaults to the config value.
-        rate_hz: unused, kept for callers. No-op if the control loop is dead.
+        No-op if the control loop is dead.
         """
         hands = tuple(HANDS if hands is None else hands)
         if not self._robots:

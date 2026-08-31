@@ -81,9 +81,6 @@ class ArmServer:
         return True
 
     # ---- RPC surface --------------------------------------------------
-    def num_dofs(self, _data=None) -> dict:
-        return {"n": np.int64(self._n_dofs)}
-
     def identity(self, _data=None) -> dict:
         """What this server actually is, so a client can refuse a mismatch.
 
@@ -98,14 +95,6 @@ class ArmServer:
         with self._lock:
             pos = np.asarray(self._robot.get_joint_pos(), dtype=np.float64)
             return {"pos": pos, "alive": np.bool_(self._alive())}
-
-    def command(self, data: dict) -> dict:
-        """Command absolute joint positions. Returns liveness, so the caller
-        can refresh its cached view without a second call."""
-        pos = np.asarray(data["pos"], dtype=float)
-        with self._lock:
-            self._robot.command_joint_pos(pos)
-            return {"alive": np.bool_(self._alive())}
 
     def command_clamped(self, data: dict) -> dict:
         """Read present pose, clamp the requested step, command — one call.
@@ -208,10 +197,8 @@ def main() -> None:
                     enable_auto_recovery=args.enable_auto_recovery)
 
     server = portal.Server(args.port, name=f"yam-{args.channel}")
-    server.bind("num_dofs", arm.num_dofs)
     server.bind("identity", arm.identity)
     server.bind("read", arm.read)
-    server.bind("command", arm.command)
     server.bind("command_clamped", arm.command_clamped)
     server.bind("park", arm.park)
 

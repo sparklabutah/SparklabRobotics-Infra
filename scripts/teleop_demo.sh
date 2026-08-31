@@ -41,8 +41,8 @@ if curl -sk --max-time 2 -o /dev/null https://127.0.0.1:8443/; then
     echo "[run] relay already listening on :8443 — reusing it"
 else
     echo "[run] starting relay (log: $LOG_DIR/relay.log)"
-    setsid env VR_TELEOP_CAMERAS_YAML="$PKG/robots/yam_ultra/config/cameras.yaml" \
-        sparklab-relay --host 0.0.0.0 \
+    setsid sparklab-relay --host 0.0.0.0 \
+        --cameras-yaml "$PKG/robots/yam_ultra/config/cameras.yaml" \
         --ssl-keyfile "$ROOT/key.pem" --ssl-certfile "$ROOT/cert.pem" \
         > "$LOG_DIR/relay.log" 2>&1 &
     PIDS+=($!)

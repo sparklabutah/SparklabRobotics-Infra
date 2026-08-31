@@ -1,13 +1,10 @@
 """Client for one ``arm_server`` process, shaped like an i2rt robot.
 
 One per arm, held by ``YamUltraFollower``; the only thing in the LeRobot
-process that talks to the motors. Duck-types the subset of ``MotorChainRobot``
-the follower calls, so moving the arms out of process left its logic untouched.
-
-Two calling styles: blocking ``get_joint_pos()`` / ``command_joint_pos()`` for
-anything off the hot path, and ``read_async()`` / ``command_clamped_async()``
-returning portal futures, so a bimanual caller can start both arms before
-waiting on either. Liveness rides back on every response — see DESIGN.md.
+process that talks to the motors. Blocking reads support setup and diagnostics;
+``read_async()`` / ``command_clamped_async()`` return portal futures so a
+bimanual caller can start both arms before waiting on either. Liveness rides
+back on every response — see DESIGN.md.
 """
 
 from __future__ import annotations
@@ -103,12 +100,6 @@ class YamArmClient:
         self._alive = bool(out["alive"])
         return np.asarray(out["pos"], dtype=float)
 
-    def command_joint_pos(self, joint_pos: np.ndarray) -> None:
-        out = self._client.call(
-            "command", {"pos": np.asarray(joint_pos, dtype=np.float64)}
-        ).result(timeout=_CALL_TIMEOUT_S)
-        self._alive = bool(out["alive"])
-
     # ---- combined read+clamp+command (one round trip) -----------------
     def read_async(self):
         """Issue a read and return the future, so a caller can overlap both arms."""
@@ -162,11 +153,6 @@ class YamArmClient:
         bimanual caller must start both arms before awaiting either.
         """
         return self._client.call("park", {"duration_s": np.float64(duration_s)})
-
-    def park(self, duration_s: float = 5.0) -> bool:
-        """Ramp home and wait. Returns whether the server reported success."""
-        out = self.park_async(duration_s).result(timeout=duration_s + _CALL_TIMEOUT_S)
-        return bool(out["ok"])
 
     def __repr__(self) -> str:
         return f"YamArmClient({self.addr}, dofs={self._n_dofs}, alive={self._alive})"

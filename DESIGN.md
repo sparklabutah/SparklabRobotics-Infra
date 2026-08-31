@@ -68,30 +68,19 @@ actually is. Walking around between engages changes nothing: the delta is
 measured from the newest engage, never an accumulated origin.
 
 The IK step takes the current EE pose from FK of the last *commanded* qpos, not
-from the robot. That open loop is what the idle resync exists to correct.
+from the robot. Every orchestrator that changes ownership or moves the arm
+directly must call `seed_qpos_from_obs()` before returning control to teleop.
 
 **The clutch anchors on the commanded pose, never the measured one.** Measured
 lags commanded by the tracking error (gravity sag, controller stiffness), and
 that error differs a little every time — an engage anchored on the measurement
 commands the arm back to a slightly different EE pose on every clutch press.
-An earlier version seeded from the measurement on each engage to fix a
-jump-after-stow; that jump came from the old bridge-side `follower.park()`
-moving the arm without a re-seed, a path that no longer exists. Every remaining
-divergence point (arm, disarm ramp, startup) is followed by an explicit
-`seed_qpos_from_obs()` in the bridge.
-
-**The idle resync only runs while nothing is calling `get_action()`.** Its job
-is the handoff after a phase where the teleop wasn't driving (a policy, a
-bridge ramp). While a consumer *is* sending the teleop's actions, snapping qpos
-to the measurement makes the command chase the gravity sag downward — a 1 Hz
-ratchet, felt as a twitch each second and a slow droop. The resync also copies
-arm joints only (the trigger holds its last commanded value so a gripper
-squeezing an object is not re-commanded to its blocked-open measurement), never
-touches an arm mid-ramp (it used to cancel the stow ramp within a second), and
-performs the observation RPC outside the teleop lock — an RPC held under that
-lock stalled the WS reader, tripping the staleness gate on a healthy connection
-and swallowing quick B/Y taps. Auto-stow is gated the opposite way: its ramp
-only reaches the robot if a consumer is sending actions.
+An earlier version seeded from the measurement on each engage and later added
+a background idle-resync thread. That coupled a teleoperator to whichever
+follower happened to be stored in process-global state, raced LeRobot's connect
+order, and could stall the WebSocket reader during robot RPC. Resynchronization
+is now an explicit orchestration step; the standalone bridge does it after
+startup and every arm/disarm motion.
 
 ### Absorbing reach limits
 
@@ -191,10 +180,8 @@ kinematic `arm_server`s so the joints move with no CAN bus. It does nothing
 about cameras — those stay real RealSense devices. A policy needs images, so a
 rollout with no hardware needs a *rendered* rig, which is this.
 
-**The Δq caps are duplicated, not shared.** `YamUltraSimConfig` copies
-`YamUltraFollowerConfig`'s values rather than importing them, to keep the
-hardware path untouched. They will therefore drift: change a cap in
-`follower.py` and change it here too. The reason they exist at all is that an
+**The Δq caps are shared by hardware and simulation.** The default lives in
+`robots/yam_ultra/constants.py`; each config still receives its own list. An
 unclamped sim silently flatters the policy — a chunk that would be cut to
 0.15 rad on hardware executes in full, so the failure you are hunting cannot
 reproduce.

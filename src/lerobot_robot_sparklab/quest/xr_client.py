@@ -15,6 +15,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 
 import websockets
 
@@ -35,7 +36,7 @@ def _ssl_context_for(url: str):
 
 
 class XRFrameClient:
-    """Background WebSocket subscriber holding the newest ``xr_frame``::
+    """Background relay client holding the newest ``xr_frame``::
 
         client = XRFrameClient("wss://127.0.0.1:8443/ws")
         client.connect(timeout_s=5.0)
@@ -43,7 +44,12 @@ class XRFrameClient:
         client.disconnect()
     """
 
-    def __init__(self, ws_url: str, name: str = "xr-client") -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        name: str = "xr-client",
+        on_message: Callable[[dict], None] | None = None,
+    ) -> None:
         self.ws_url = ws_url
         self._name = name
         self._lock = threading.Lock()
@@ -54,15 +60,19 @@ class XRFrameClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws = None
         self._connected = threading.Event()
+        self._on_message = on_message
 
     # ---- lifecycle --------------------------------------------------------
     def connect(self, timeout_s: float = 5.0) -> None:
         if self.is_connected:
             return
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError(f"{self._name}: connection thread is already running")
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._main, name=self._name, daemon=True)
         self._thread.start()
         if not self._connected.wait(timeout=timeout_s):
+            self.disconnect()
             raise RuntimeError(f"{self._name}: timed out connecting to {self.ws_url}")
         logger.info("%s connected to %s", self._name, self.ws_url)
 
@@ -78,6 +88,9 @@ class XRFrameClient:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._connected.clear()
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
+            self._stop = None
 
     @property
     def is_connected(self) -> bool:
@@ -112,6 +125,7 @@ class XRFrameClient:
             self._loop.run_until_complete(self._run())
         finally:
             self._loop.close()
+            self._loop = None
 
     async def _run(self) -> None:
         assert self._stop is not None
@@ -128,11 +142,15 @@ class XRFrameClient:
                             msg = json.loads(raw)
                         except Exception:
                             continue
-                        if msg.get("type") != "xr_frame":
-                            continue
-                        with self._lock:
-                            self._frame = msg
-                            self._frame_time = time.time()
+                        if msg.get("type") == "xr_frame":
+                            with self._lock:
+                                self._frame = msg
+                                self._frame_time = time.time()
+                        if self._on_message is not None:
+                            try:
+                                self._on_message(msg)
+                            except Exception:
+                                logger.exception("%s: message callback failed", self._name)
             except Exception as e:
                 # Reconnect rather than ending the session: WiFi/tunnel jitter
                 # drops this link routinely mid-run.

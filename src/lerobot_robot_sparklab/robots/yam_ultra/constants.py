@@ -1,0 +1,3 @@
+ARM_JOINTS = 6
+HANDS = ("left", "right")
+DEFAULT_MAX_RELATIVE_TARGET = (0.133, 0.133, 0.133, 0.15, 0.15, 0.15)

@@ -41,26 +41,6 @@ logging.basicConfig(
 logger = logging.getLogger("teleop_bimanual")
 
 
-def ramp(follower: YamUltraFollower, targets: dict, duration_s: float, rate_hz: float = 50.0) -> None:
-    """Slow synchronized interpolation of both arms' joints to per-hand
-    target poses (gripper held at its last observed value)."""
-    obs = follower.get_observation()
-    starts = {h: np.array([obs[f"{h}_joint_{j}.pos"] for j in range(1, ARM_JOINTS + 1)])
-              for h in HANDS}
-    grippers = {h: obs[f"{h}_gripper.pos"] for h in HANDS}
-    steps = max(1, int(duration_s * rate_hz))
-    for i in range(steps + 1):
-        a = i / steps
-        action: dict[str, float] = {}
-        for h in HANDS:
-            q = (1.0 - a) * starts[h] + a * targets[h]
-            for j in range(1, ARM_JOINTS + 1):
-                action[f"{h}_joint_{j}.pos"] = float(q[j - 1])
-            action[f"{h}_gripper.pos"] = grippers[h]
-        follower.send_action(action)
-        time.sleep(1.0 / rate_hz)
-
-
 def seed_from_follower(teleop: BiQuestTeleoperator, follower: YamUltraFollower) -> None:
     teleop.seed_qpos_from_obs(follower.get_observation())
 
@@ -99,9 +79,7 @@ def main() -> None:
         right_channel=args.right_channel,
         sim=args.sim,
         gripper_flip=args.gripper_flip,
-        # This script's own dq_caps clamp below is the safety layer; leave the
-        # Follower's off to avoid two clamps disagreeing.
-        max_relative_target=None,
+        max_relative_target=[args.max_dq_pos] * 3 + [args.max_dq_rot] * 3,
         # This script parks explicitly in its finally block (and on disarm), so
         # don't ramp a second time inside disconnect(). --no-park disables both.
         park_on_disconnect=False,
@@ -135,10 +113,7 @@ def main() -> None:
 
     armed = False
     last_handoff = False
-    cmd = {h: home[h].copy() for h in HANDS}
     cmd_gripper = {h: obs0[f"{h}_gripper.pos"] for h in HANDS}
-    dq_caps = np.array([args.max_dq_pos] * 3 + [args.max_dq_rot] * 3)
-    last_clamp_warn = 0.0
     logger.info("DISARMED, holding home — press B/Y to arm. Ctrl-C ramps home & exits.")
 
     period = 1.0 / args.freq
@@ -160,15 +135,14 @@ def main() -> None:
                     armed = False
                     logger.info("DISARMING: ramping both arms home (%.1fs) ...",
                                 args.home_ramp_s)
-                    ramp(follower, home, args.home_ramp_s)
+                    follower.move_to(home, args.home_ramp_s)
                     # Re-sync the teleop to the parked pose so its internal
                     # state (and the viewer) never diverges from the robots.
                     seed_from_follower(teleop, follower)
                     logger.info("DISARMED, holding home — B/Y to re-arm.")
-                # Baseline for the per-tick clamp = where the arms really are.
+                # Refresh the held gripper command from the measured state.
                 obs = follower.get_observation()
                 for h in HANDS:
-                    cmd[h] = np.array([obs[f"{h}_joint_{j}.pos"] for j in range(1, ARM_JOINTS + 1)])
                     cmd_gripper[h] = obs[f"{h}_gripper.pos"]
                 next_tick = time.perf_counter()
                 # The action in hand predates the seed — never command it.
@@ -178,19 +152,8 @@ def main() -> None:
             if armed:
                 send: dict[str, float] = {}
                 for h in HANDS:
-                    target = np.array([action[f"{h}_joint_{j}.pos"]
-                                       for j in range(1, ARM_JOINTS + 1)])
-
-                    step = target - cmd[h]
-                    clamped = np.clip(step, -dq_caps, dq_caps)
-                    if (np.abs(step) > dq_caps + 1e-9).any() and \
-                            time.perf_counter() - last_clamp_warn > 1.0:
-                        last_clamp_warn = time.perf_counter()
-                        logger.warning("%s action jumped %.3f rad max — clamped to caps "
-                                       "(state desync?)", h, float(np.abs(step).max()))
-                    cmd[h] += clamped
                     for j in range(1, ARM_JOINTS + 1):
-                        send[f"{h}_joint_{j}.pos"] = float(cmd[h][j - 1])
+                        send[f"{h}_joint_{j}.pos"] = float(action[f"{h}_joint_{j}.pos"])
                     if n_dofs[h] > ARM_JOINTS:
                         cmd_gripper[h] = float(action.get(f"{h}_gripper.pos", 0.0))
                     send[f"{h}_gripper.pos"] = cmd_gripper[h]
@@ -209,7 +172,7 @@ def main() -> None:
         try:
             if not args.no_park:
                 logger.info("ramping home before torques off ...")
-                ramp(follower, home, args.home_ramp_s)
+                follower.move_to(home, args.home_ramp_s)
         finally:
             follower.disconnect()
 

@@ -23,7 +23,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -273,7 +272,7 @@ class CameraTrack(VideoStreamTrack):
 # ── Camera registry ──────────────────────────────────────────────────────
 # Only cameras actually present are registered, so a missing one disappears.
 
-def _load_camera_specs_from_yaml(path: Path, width: int, height: int, fps: int) -> list[CameraSpec]:
+def _load_camera_specs_from_yaml(path: Path) -> list[CameraSpec]:
     import yaml
 
     data = yaml.safe_load(path.read_text()) or {}
@@ -285,9 +284,9 @@ def _load_camera_specs_from_yaml(path: Path, width: int, height: int, fps: int) 
             id=cam_id,
             label=cfg.get("label", cam_id.replace("_", " ").title()),
             device=cfg.get("device"),
-            width=cfg.get("width", width),
-            height=cfg.get("height", height),
-            fps=cfg.get("fps", fps),
+            width=cfg.get("width", 640),
+            height=cfg.get("height", 480),
+            fps=cfg.get("fps", 30),
             rotate=cfg.get("rotate", 0),
             backend=backend,
             serial=str(cfg["serial"]) if "serial" in cfg else None,
@@ -299,51 +298,7 @@ def _load_camera_specs_from_yaml(path: Path, width: int, height: int, fps: int) 
     return specs
 
 
-def _build_camera_specs() -> list[CameraSpec]:
-    width = int(os.environ.get("CAM_WIDTH", "640"))
-    height = int(os.environ.get("CAM_HEIGHT", "480"))
-    fps = int(os.environ.get("CAM_FPS", "30"))
-
-    yaml_path = os.environ.get("VR_TELEOP_CAMERAS_YAML")
-    if yaml_path:
-        p = Path(yaml_path)
-        if not p.exists():
-            logger.warning("VR_TELEOP_CAMERAS_YAML=%s does not exist, ignoring", yaml_path)
-        else:
-            specs = _load_camera_specs_from_yaml(p, width, height, fps)
-            logger.info("loaded %d camera(s) from %s", len(specs), p)
-            return specs
-
-    def _rotate(env_key: str) -> int:
-        raw = os.environ.get(env_key, "0").strip() or "0"
-        try:
-            r = int(raw) % 360
-        except ValueError:
-            logger.warning("%s=%r not an int, defaulting to 0", env_key, raw)
-            return 0
-        if r not in (0, 90, 180, 270):
-            logger.warning("%s=%d not in {0,90,180,270}, defaulting to 0", env_key, r)
-            return 0
-        return r
-
-    candidates = [
-        ("top",         "Top",         os.environ.get("CAM_TOP"),   _rotate("CAM_TOP_ROTATE")),
-        ("left_wrist",  "Left wrist",  os.environ.get("CAM_LEFT"),  _rotate("CAM_LEFT_ROTATE")),
-        ("right_wrist", "Right wrist", os.environ.get("CAM_RIGHT"), _rotate("CAM_RIGHT_ROTATE")),
-    ]
-    specs: list[CameraSpec] = []
-    for cam_id, label, device, rotate in candidates:
-        if not device:
-            logger.info("camera %s: env var unset, skipping", cam_id)
-            continue
-        if not Path(device).exists():
-            logger.warning("camera %s: %s not present, skipping", cam_id, device)
-            continue
-        specs.append(CameraSpec(cam_id, label, device, width, height, fps, rotate))
-    return specs
-
-
-CAMERA_SPECS: list[CameraSpec] = _build_camera_specs()
+CAMERA_SPECS: list[CameraSpec] = []
 CAMERA_READERS: dict[str, CameraReader | RealSenseCameraReader] = {}
 
 
@@ -578,7 +533,14 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--ssl-keyfile",  default=None, help="Path to TLS private key (PEM).")
     ap.add_argument("--ssl-certfile", default=None, help="Path to TLS cert chain (PEM).")
+    ap.add_argument("--cameras-yaml", type=Path, help="Camera rig YAML; omit for pose-only relay.")
     args = ap.parse_args()
+
+    if args.cameras_yaml is not None:
+        if not args.cameras_yaml.is_file():
+            ap.error(f"camera config does not exist: {args.cameras_yaml}")
+        CAMERA_SPECS.extend(_load_camera_specs_from_yaml(args.cameras_yaml))
+        logger.info("loaded %d camera(s) from %s", len(CAMERA_SPECS), args.cameras_yaml)
 
     import uvicorn
     uvicorn.run(

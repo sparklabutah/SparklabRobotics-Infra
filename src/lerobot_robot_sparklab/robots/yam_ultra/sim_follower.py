@@ -30,10 +30,10 @@ from lerobot.cameras import CameraConfig  # noqa: F401  (schema parity)
 from lerobot.robots.robot import Robot
 from lerobot.robots.config import RobotConfig
 
+from .constants import ARM_JOINTS, DEFAULT_MAX_RELATIVE_TARGET, HANDS
+
 logger = logging.getLogger(__name__)
 
-HANDS = ("left", "right")
-ARM_JOINTS = 6
 # Fixed by the recorded dataset's meta/info.json; the server crops to match.
 IMAGE_SHAPE = (360, 640, 3)
 CAMERA_NAMES = ("top", "left_wrist", "right_wrist")
@@ -62,10 +62,9 @@ class YamUltraSimConfig(RobotConfig):
     park_on_disconnect: bool = True
     park_seconds: float = 2.5
 
-    # ---- action shaping, deliberately mirroring the hardware follower ------
-    # DUPLICATED from YamUltraFollowerConfig: change a cap there, change it here.
+    # ---- action shaping, shared with the hardware follower -----------------
     max_relative_target: float | list[float] | None = field(
-        default_factory=lambda: [0.133, 0.133, 0.133, 0.15, 0.15, 0.15]
+        default_factory=lambda: list(DEFAULT_MAX_RELATIVE_TARGET)
     )
 
 

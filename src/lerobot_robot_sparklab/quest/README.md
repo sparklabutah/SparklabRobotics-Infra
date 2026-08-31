@@ -128,6 +128,10 @@ thread:
 client.send({"type": "ik_state", "right_qpos": [...], "right_haptic": 0.4})
 ```
 
+Consumers that also handle relay control messages can pass `on_message=`. The
+callback runs on the relay thread for every decoded message; `latest()` remains
+the lock-protected path for reading controller frames from a control loop.
+
 ### Button indices
 
 | constant | index | typical use |

@@ -7,9 +7,11 @@ Robot-agnostic.
 Console script: **`sparklab-relay`** (from `pip install -e ".[relay]"`).
 
 ```
-server.py       the whole server — WS relay, WebRTC, camera readers
+server.py       WS relay, WebRTC signaling, camera readers
 web/index.html  the page the Quest loads
-web/client.js   WebXR session, pose sampling, camera quads, haptics
+web/client.js   UI and per-frame controller/camera orchestration
+web/xr-support.js          XR lifecycle and transform helpers
+web/pivot-calibration.js   wrist-pivot calibration math
 ```
 
 Message schemas and the Python subscriber side are in
@@ -41,11 +43,10 @@ cameras exist, builds one `VideoStreamTrack` per camera, and exchanges SDP over
 the same WebSocket. There is no second port. Trickle ICE from the browser is
 dropped — aiortc gathers all local candidates before offering.
 
-Camera specs come from `CAM_TOP`/`CAM_LEFT`/`CAM_RIGHT` env vars (legacy fixed
-3-slot v4l2) or, if `VR_TELEOP_CAMERAS_YAML` is set, a YAML file listing
-arbitrary cameras by id — v4l2 by device path or RealSense by serial. The
-YAM-Ultra's rig file is `robots/yam_ultra/config/cameras.yaml`; camera ids
-there become both the VR panel slots and the LeRobot dataset keys
+Camera specs come from `--cameras-yaml`, which accepts arbitrary cameras by id,
+using either a v4l2 device path or a RealSense serial. With no file the relay is
+pose-only. The YAM-Ultra's rig file is `robots/yam_ultra/config/cameras.yaml`;
+camera ids become both the VR panel slots and the LeRobot dataset keys
 (`observation.images.<id>`).
 
 ## Latency
