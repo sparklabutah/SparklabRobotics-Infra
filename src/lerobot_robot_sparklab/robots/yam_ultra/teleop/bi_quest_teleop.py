@@ -116,6 +116,8 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
     # Go-home ramp: lerp qpos[:6] to rest_qpos_{hand} over this window.
     rest_ramp_duration_s: float = 2.0
 
+    # Both act only with both hands disengaged; the resync additionally only
+    # while nothing is calling get_action(). None disables either.
     idle_resync_interval_s: float | None = 1.0
     auto_stow_idle_s: float | None = None
 
@@ -430,56 +432,73 @@ class BiQuestTeleoperator(Teleoperator):
                 arm["needs_reanchor"] = False
 
     def _idle_resync_loop(self) -> None:
-        """Poll _check_idle_resync_and_autostow() regardless of get_action() calls."""
+        """Own thread: cover the phases where nothing calls get_action()."""
         stop = self._idle_resync_stop
         assert stop is not None
         while not stop.is_set():
-            with self._lock:
-                self._check_idle_resync_and_autostow()
+            self._idle_resync_tick()
             stop.wait(0.2)
 
-    def _check_idle_resync_and_autostow(self) -> None:
-        """Resync qpos and optionally auto-stow once both hands have gone idle.
+    def _idle_resync_tick(self) -> None:
+        """Resync qpos to the measurement, or auto-stow, once both hands are idle.
 
-        Whole-body: seed_qpos_from_obs() and follower.park() act on both hands,
-        so this fires only when neither is engaged.
+        The resync runs only while get_action() is NOT being consumed; auto-stow
+        only while it IS (a ramp needs a live consumer). See DESIGN.md.
         """
-        both_disengaged = not self._arms["left"]["engaged"] and not self._arms["right"]["engaged"]
         now = time.monotonic()
-        if not both_disengaged:
-            self._idle_since = None
-            self._auto_stowed_this_idle = False
-            return
-        if self._idle_since is None:
-            self._idle_since = now
-        idle_for = now - self._idle_since
+        with self._lock:
+            both_disengaged = (
+                not self._arms["left"]["engaged"] and not self._arms["right"]["engaged"]
+            )
+            ramping = self._arms["left"]["ramp_active"] or self._arms["right"]["ramp_active"]
+            if not both_disengaged:
+                self._idle_since = None
+                self._auto_stowed_this_idle = False
+                return
+            if self._idle_since is None:
+                self._idle_since = now
+            idle_for = now - self._idle_since
+            last_tick_t = self._last_get_action_t
 
-        follower = self._stow_follower
-        if follower is None:
-            from ..follower import get_last_connected_follower
-            follower = get_last_connected_follower()
-            if follower is not None:
-                self._stow_follower = follower
+        follower = self._resolve_follower()
         if follower is None:
             return  # pure-sim / no robot connected — nothing to resync against
+        driven = last_tick_t is not None and (time.perf_counter() - last_tick_t) < 1.0
 
         auto_stow_s = self.config.auto_stow_idle_s
-        if auto_stow_s is not None and idle_for >= auto_stow_s and not self._auto_stowed_this_idle:
-            # Set before the blocking park() so a threaded caller can't double-park.
+        if (
+            driven
+            and auto_stow_s is not None
+            and idle_for >= auto_stow_s
+            and not self._auto_stowed_this_idle
+        ):
             self._auto_stowed_this_idle = True
             logger.info("idle %.1fs with both arms disengaged — auto-stowing", idle_for)
-            try:
-                follower.park()
-            except Exception:
-                logger.exception("auto-stow park() failed")
+            with self._lock:
+                for hand in ("left", "right"):
+                    arm = self._arms[hand]
+                    self._stow_arm(hand, arm, arm["pos_filt"], arm["quat_filt"])
+            return
 
         interval = self.config.idle_resync_interval_s
-        if interval and now - self._last_idle_resync_t >= interval:
-            self._last_idle_resync_t = now
-            try:
-                self.seed_qpos_from_obs(follower.get_observation())
-            except Exception:
-                logger.exception("idle resync failed")
+        if driven or ramping or not interval or now - self._last_idle_resync_t < interval:
+            return
+        self._last_idle_resync_t = now
+        try:
+            obs = follower.get_observation()  # RPC deliberately outside the lock
+        except Exception:
+            logger.exception("idle resync failed")
+            return
+        with self._lock:
+            for hand in ("left", "right"):
+                arm = self._arms[hand]
+                # Re-checked post-RPC: the operator may have engaged meanwhile.
+                if arm["engaged"] or arm["ramp_active"]:
+                    continue
+                for j in range(ARM_DOFS):
+                    key = f"{hand}_joint_{j + 1}.pos"
+                    if key in obs:
+                        arm["qpos"][j] = float(obs[key])
 
     def get_action(self) -> dict[str, float]:
         now = time.perf_counter()
@@ -494,7 +513,6 @@ class BiQuestTeleoperator(Teleoperator):
             xr = self._latest_xr_frame
             last_frame_time = self._last_xr_frame_time
             if xr is None:
-                self._check_idle_resync_and_autostow()
                 return self._build_action()
 
             gap_s = time.time() - last_frame_time
@@ -502,7 +520,6 @@ class BiQuestTeleoperator(Teleoperator):
             for hand in ("left", "right"):
                 self._update_arm(hand, ctrls.get(hand), gap_s)
 
-            self._check_idle_resync_and_autostow()
             action = self._build_action()
 
             if self.config.publish_ik_state and self._ws is not None and self._ws_loop is not None:
@@ -522,31 +539,47 @@ class BiQuestTeleoperator(Teleoperator):
             out[f"{hand}_gripper.pos"] = float(np.clip(arm["trigger"], 0.0, 1.0))
         return out
 
+    def _resolve_follower(self):
+        """The connected follower, resolved lazily; None if there is none."""
+        follower = self._stow_follower
+        if follower is None:
+            from ..follower import get_last_connected_follower
+
+            follower = get_last_connected_follower()
+            if follower is not None:
+                self._stow_follower = follower
+                logger.info("bound to %s on first use", follower)
+        return follower
+
     def _stow_arm(
         self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray
     ) -> None:
-        """Thumbstick STOW: ramp this arm home via the follower, then resync.
+        """Thumbstick STOW: ramp this arm home without blocking the loop.
 
-        Blocks for the ramp deliberately — the alternative is recording frames
-        the operator never commanded. Re-anchors afterwards if still engaged.
+        The ramp is advanced a step per tick by _update_arm, so the control
+        loop keeps running: the other hand stays live and a second stow press
+        is seen immediately. Blocking here (the old follower.park() call) is
+        what made two stows run back to back for the full duration each, and
+        why the second press was not even detected until the first finished.
+
+        Targets rest_qpos, which the bridge sets to the pose the arms powered
+        up in, so a stowed arm and the bridge's idea of home agree. park()
+        ramps to zero instead and stays what it is: the safe pose for cutting
+        torque on disconnect.
         """
-        follower = self._stow_follower
-        logger.info("%s STOW: ramping home via follower ...", hand)
-        try:
-            follower.park(hands=[hand])
-        except Exception:
-            logger.exception("%s stow failed", hand)
-            return
-        try:
-            self.seed_qpos_from_obs(follower.get_observation())
-        except Exception:
-            logger.exception("%s stow: resync after ramp failed", hand)
-            return
-        if arm["engaged"]:
-            self._anchor_mapper(
-                hand, arm, pos, quat_wxyz, "STOW-DONE")
+        target = (
+            self.config.rest_qpos_left if hand == "left" else self.config.rest_qpos_right
+        )
+        arm["ramp_start_q"] = arm["qpos"][:ARM_DOFS].copy()
+        arm["ramp_target_q"] = np.asarray(target, dtype=float)
+        arm["ramp_start_t"] = time.perf_counter()
+        arm["ramp_active"] = True
         arm["haptic"] = 0.0
-        logger.info("%s STOW done.", hand)
+        logger.info(
+            "%s STOW: ramping home over %.1fs (non-blocking, target=%s)",
+            hand, self.config.rest_ramp_duration_s,
+            arm["ramp_target_q"].round(3).tolist(),
+        )
 
     def _anchor_mapper(
         self, hand: str, arm: dict, pos: np.ndarray, quat_wxyz: np.ndarray, label: str
@@ -555,11 +588,13 @@ class BiQuestTeleoperator(Teleoperator):
 
         label: log tag for the calling path (ENGAGE, RE-ANCHOR, PRECISION, ...).
         """
+        # Anchors at the last COMMANDED qpos, never the measurement: measured
+        # lags command by the tracking error. See DESIGN.md#teleoperation.
         ee_pos, ee_quat = arm["solver"].fk(arm["qpos"])
         j4_pos = arm["solver"].j4_anchor_xpos()
         arm["mapper"].engage(pos, quat_wxyz, ee_pos, ee_quat, pivot_armbase=j4_pos)
         arm["engaged"] = True
-        logger.debug(
+        logger.info(
             "%s clutch %s  ee_pos=%s  j4_pos=%s",
             hand, label, ee_pos.round(3),
             j4_pos.round(3) if j4_pos is not None else "—",
@@ -575,8 +610,6 @@ class BiQuestTeleoperator(Teleoperator):
         quat_raw = np.array([ow, ox, oy, oz])
 
         buttons = ctrl.get("buttons") or []
-        # A short button array reads as "never pressed" forever; log the layout
-        # once per hand so that failure mode is visible rather than silent.
         if not arm.get("logged_button_layout") and buttons:
             arm["logged_button_layout"] = True
             pressed_idx = [i for i, b in enumerate(buttons) if b.get("p")]
@@ -585,58 +618,48 @@ class BiQuestTeleoperator(Teleoperator):
                 "or %d [B/Y], grip is index %d; currently pressed: %s)",
                 hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX, GRIP_BUTTON_INDEX,
                 pressed_idx or "none")
-            if len(buttons) <= REST_RAMP_BUTTON_INDEX and len(buttons) <= HANDOFF_BUTTON_INDEX:
-                logger.warning(
-                    "%s controller exposes only %d buttons — both stow indices (%d, %d) are "
-                    "out of range, so stow can never trigger on this hand.",
-                    hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX)
+            if len(buttons) <= REST_RAMP_BUTTON_INDEX:
+                if len(buttons) > HANDOFF_BUTTON_INDEX:
+                    logger.warning(
+                        "%s controller exposes only %d buttons — no thumbstick at index %d, "
+                        "so stow falls back to B/Y on this hand and will also toggle "
+                        "the bridge's ARMED state.",
+                        hand, len(buttons), REST_RAMP_BUTTON_INDEX)
+                else:
+                    logger.warning(
+                        "%s controller exposes only %d buttons — neither stow index (%d, %d) "
+                        "is in range, so stow can never trigger on this hand.",
+                        hand, len(buttons), REST_RAMP_BUTTON_INDEX, HANDOFF_BUTTON_INDEX)
 
-        # Read BEFORE the staleness gate: stow needs no fresh pose and must keep
-        # working exactly when the connection degrades. B/Y triggers it too.
         thumb_pressed = (
             bool(buttons[REST_RAMP_BUTTON_INDEX]["p"]) if len(buttons) > REST_RAMP_BUTTON_INDEX else False
         )
         handoff_pressed = (
             bool(buttons[HANDOFF_BUTTON_INDEX]["p"]) if len(buttons) > HANDOFF_BUTTON_INDEX else False
         )
-        rest_btn = thumb_pressed or handoff_pressed
+        
+        # B/Y belongs to the bridge: it toggles ARMED, and is_handoff_pressed()
+        # ORs the two hands, so the bridge cannot tell which one pressed. Wiring
+        # stow to B/Y as well meant one press did both jobs - the first hand
+        # armed and stowed, the second hand's press toggled the bridge straight
+        # back to DISARMED, and only the first arm ever moved. Stow is the
+        # thumbstick; B/Y is only a fallback for a controller that has none.
+        has_thumbstick = len(buttons) > REST_RAMP_BUTTON_INDEX
+        rest_btn = thumb_pressed if has_thumbstick else handoff_pressed
         if rest_btn and not arm["last_rest_button"] and not arm["ramp_active"]:
             # Always announce: silence here means the index is wrong, which is a
             # different problem from "stow ran but the arm didn't move".
-            logger.info("%s %s pressed (rising edge)", hand, "thumbstick" if thumb_pressed else "B/Y")
-            # Resolve lazily: connect() order isn't enforced, and trusting it would
-            # silently degrade stow to the rest_qpos ramp.
-            follower = self._stow_follower
-            if follower is None:
-                from ..follower import get_last_connected_follower
-                follower = get_last_connected_follower()
-                if follower is not None:
-                    self._stow_follower = follower
-                    logger.info("stow: bound to %s on first use", follower)
-            arm["last_rest_button"] = rest_btn
-            if follower is not None:
-                # The follower's joint-space ramp targets the powered-up pose, not
-                # the generic rest_qpos, and keeps IK out of the loop entirely.
-                self._stow_arm(hand, arm, pos_raw, quat_raw)
-                return
-            logger.warning(
-                "%s thumbstick: no follower registered — falling back to the internal "
-                "rest_qpos ramp (target %s). On hardware this means stow will move the "
-                "arm to that generic pose, not the pose it powered up in.",
-                hand, np.round(self.config.rest_qpos_left if hand == "left"
-                               else self.config.rest_qpos_right, 3).tolist())
-            target = self.config.rest_qpos_left if hand == "left" else self.config.rest_qpos_right
-            arm["ramp_start_q"] = arm["qpos"][:ARM_DOFS].copy()
-            arm["ramp_target_q"] = np.asarray(target, dtype=float)
-            arm["ramp_start_t"] = time.perf_counter()
-            arm["ramp_active"] = True
-            logger.debug(
-                "%s rest-ramp START (duration=%.2fs, target=%s, engaged=%s)",
-                hand,
-                self.config.rest_ramp_duration_s,
-                arm["ramp_target_q"].round(3),
-                arm["engaged"],
+            logger.info(
+                "%s %s pressed (rising edge) — stowing this arm",
+                hand, "thumbstick" if thumb_pressed else "B/Y (no thumbstick on this controller)",
             )
+            arm["last_rest_button"] = rest_btn
+            # One stow path now. It ramps to rest_qpos, which the bridge sets to
+            # the powered-up pose, and it does not block: the old follower.park()
+            # branch held the control loop for the whole ramp, so two arms could
+            # never stow at the same time and the second press went unseen.
+            self._stow_arm(hand, arm, pos_raw, quat_raw)
+            return
         else:
             arm["last_rest_button"] = rest_btn
 
@@ -684,21 +707,19 @@ class BiQuestTeleoperator(Teleoperator):
         # Re-anchor after a stale window if the grip is still held; a release
         # during the stall falls through to the normal disengage edge below.
         if arm["needs_reanchor"] and arm["engaged"] and grip:
-            self._anchor_mapper(
-                hand, arm, pos, quat_wxyz, "RE-ANCHOR")
+            self._anchor_mapper(hand, arm, pos, quat_wxyz, "RE-ANCHOR")
         arm["needs_reanchor"] = False
 
         # Edge-detect clutch.
         if grip and not arm["last_grip"]:
-            self._anchor_mapper(
-                hand, arm, pos, quat_wxyz, "ENGAGE")
+            self._anchor_mapper(hand, arm, pos, quat_wxyz, "ENGAGE")
         elif not grip and arm["last_grip"]:
             arm["mapper"].disengage()
             arm["engaged"] = False
             # Dropped on release so the next engage has no lerp-lag from old state.
             arm["pos_filt"] = None
             arm["quat_filt"] = None
-            logger.debug("%s clutch RELEASE", hand)
+            logger.info("%s clutch RELEASE", hand)
         arm["last_grip"] = grip
 
         # Engaged only: otherwise stray trigger pressure would move the gripper
@@ -720,8 +741,7 @@ class BiQuestTeleoperator(Teleoperator):
                 arm["ramp_active"] = False
                 if arm["engaged"]:
                     # Re-anchor at the rest EE so the first IK tick doesn't jump.
-                    self._anchor_mapper(
-                hand, arm, pos, quat_wxyz, "RAMP-DONE")
+                    self._anchor_mapper(hand, arm, pos, quat_wxyz, "RAMP-DONE")
                 else:
                     logger.debug("%s rest-ramp DONE (disengaged)", hand)
             arm["haptic"] *= 0.6  # decay haptic during the ramp

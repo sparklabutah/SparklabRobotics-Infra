@@ -70,6 +70,29 @@ measured from the newest engage, never an accumulated origin.
 The IK step takes the current EE pose from FK of the last *commanded* qpos, not
 from the robot. That open loop is what the idle resync exists to correct.
 
+**The clutch anchors on the commanded pose, never the measured one.** Measured
+lags commanded by the tracking error (gravity sag, controller stiffness), and
+that error differs a little every time — an engage anchored on the measurement
+commands the arm back to a slightly different EE pose on every clutch press.
+An earlier version seeded from the measurement on each engage to fix a
+jump-after-stow; that jump came from the old bridge-side `follower.park()`
+moving the arm without a re-seed, a path that no longer exists. Every remaining
+divergence point (arm, disarm ramp, startup) is followed by an explicit
+`seed_qpos_from_obs()` in the bridge.
+
+**The idle resync only runs while nothing is calling `get_action()`.** Its job
+is the handoff after a phase where the teleop wasn't driving (a policy, a
+bridge ramp). While a consumer *is* sending the teleop's actions, snapping qpos
+to the measurement makes the command chase the gravity sag downward — a 1 Hz
+ratchet, felt as a twitch each second and a slow droop. The resync also copies
+arm joints only (the trigger holds its last commanded value so a gripper
+squeezing an object is not re-commanded to its blocked-open measurement), never
+touches an arm mid-ramp (it used to cancel the stow ramp within a second), and
+performs the observation RPC outside the teleop lock — an RPC held under that
+lock stalled the WS reader, tripping the staleness gate on a healthy connection
+and swallowing quick B/Y taps. Auto-stow is gated the opposite way: its ramp
+only reaches the robot if a consumer is sending actions.
+
 ### Absorbing reach limits
 
 With `rot_reach_limit` / `pos_reach_limit` active, the mapper becomes

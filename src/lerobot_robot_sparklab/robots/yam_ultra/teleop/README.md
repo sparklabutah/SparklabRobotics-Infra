@@ -64,8 +64,9 @@ controllers, one driving and the other free for the B/Y handoff button.
   holds still while released.
 - **Trigger = gripper**, analog.
 - **A/X = precision scale**, held.
-- **Thumbstick click** stows that arm — a joint-space ramp home through the
-  follower. B/Y does the same.
+- **Thumbstick click** stows that arm — a non-blocking joint-space ramp to
+  `rest_qpos`. B/Y is the bridge's ARM/DISARM toggle and acts as the stow
+  button only on a controller with no thumbstick.
 - Nothing moves at startup: the teleop is seeded with the robot's measured
   joint positions, so the first commands hold pose. **The gripper self-homes
   once during driver init** — keep fingers clear.
