@@ -68,6 +68,11 @@ def main() -> None:
     ap.add_argument("--max-dq-rot", type=float, default=0.16)
     ap.add_argument("--scale-translation", type=float, default=0.8)
     ap.add_argument("--scale-rotation", type=float, default=0.8)
+    ap.add_argument(
+        "--rerun-poses",
+        action="store_true",
+        help="open Rerun views for headset, controller, and end-effector poses",
+    )
     ap.add_argument("--no-park", action="store_true",
                     help="on exit, do not ramp home before torques off")
     ap.add_argument("--id", default="vr-teleop-yam-bi-hw")
@@ -79,7 +84,7 @@ def main() -> None:
         right_channel=args.right_channel,
         sim=args.sim,
         gripper_flip=args.gripper_flip,
-        max_relative_target=[args.max_dq_pos] * 3 + [args.max_dq_rot] * 3,
+        max_relative_target=None,
         # This script parks explicitly in its finally block (and on disarm), so
         # don't ramp a second time inside disconnect(). --no-park disables both.
         park_on_disconnect=False,
@@ -107,6 +112,7 @@ def main() -> None:
         scale_translation=args.scale_translation,
         scale_rotation=args.scale_rotation,
         rest_ramp_duration_s=args.rest_ramp_s,
+        rerun_pose_debug=args.rerun_poses,
     ))
     teleop.connect()
     seed_from_follower(teleop, follower)

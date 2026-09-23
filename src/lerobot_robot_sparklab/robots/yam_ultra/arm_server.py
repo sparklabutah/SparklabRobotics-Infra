@@ -23,8 +23,10 @@ Run one per arm; the follower connects to them, it does not start them:
     python -m lerobot_robot_sparklab.robots.yam_ultra.arm_server \\
         --channel can_left --port 11333
 
-``--sim`` backs it with an i2rt SimRobot. ``scripts/start_arm_servers.sh``
-launches both at the ports the follower defaults to.
+``--sim`` backs it with an i2rt SimRobot. Add ``--viewer`` to display that
+model in a live MuJoCo window. ``scripts/start_arm_servers.sh --sim`` enables
+the viewer automatically and launches both at the ports the follower defaults
+to.
 
 SAFETY: i2rt's ``close()`` cuts torque wherever the arm stands, so Ctrl-C would
 drop it. ``--park-on-exit`` (default on) ramps to the startup pose first.
@@ -172,6 +174,29 @@ class ArmServer:
         except Exception:
             logger.exception("error closing the i2rt robot")
 
+    def run_viewer(self, stop: threading.Event) -> None:
+        """Show this SimRobot's live MuJoCo state until closed or stopped."""
+        if not self.sim:
+            raise RuntimeError("the MuJoCo viewer is only available with --sim")
+
+        model = getattr(self._robot, "_model", None)
+        data = getattr(self._robot, "_data", None)
+        robot_lock = getattr(self._robot, "_lock", None)
+        if model is None or data is None or robot_lock is None:
+            raise RuntimeError("the installed i2rt SimRobot has no viewable MuJoCo state")
+
+        import mujoco.viewer
+
+        logger.info("opening MuJoCo viewer for %s", self.channel)
+        with mujoco.viewer.launch_passive(model, data) as viewer:
+            while not stop.is_set() and viewer.is_running():
+                with robot_lock:
+                    viewer.sync()
+                stop.wait(1.0 / 60.0)
+        if not stop.is_set():
+            logger.info("MuJoCo viewer closed for %s", self.channel)
+            stop.set()
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -179,6 +204,8 @@ def main() -> None:
     ap.add_argument("--port", type=int, required=True, help="portal RPC port")
     ap.add_argument("--sim", action="store_true",
                     help="i2rt SimRobot instead of CAN hardware (nothing physical moves)")
+    ap.add_argument("--viewer", action="store_true",
+                    help="show the live SimRobot in MuJoCo (requires --sim)")
     ap.add_argument("--enable-auto-recovery", action="store_true",
                     help="let i2rt clear + re-enable an errored motor from inside its "
                          "control loop. NOTE: recovery re-asserts the pre-error target "
@@ -189,6 +216,8 @@ def main() -> None:
                          "(support the arm yourself)")
     ap.add_argument("--park-duration-s", type=float, default=5.0)
     args = ap.parse_args()
+    if args.viewer and not args.sim:
+        ap.error("--viewer requires --sim")
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -216,7 +245,10 @@ def main() -> None:
                 args.channel, args.port,
                 "" if args.no_park_on_exit else " (will park home first)")
     try:
-        stop.wait()
+        if args.viewer:
+            arm.run_viewer(stop)
+        else:
+            stop.wait()
     finally:
         try:
             server.close()

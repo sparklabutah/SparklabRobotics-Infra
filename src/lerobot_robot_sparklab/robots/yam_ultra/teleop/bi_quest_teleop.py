@@ -10,11 +10,13 @@ get_action() returns {left,right}_joint_{1..6}.pos (rad) and
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TypedDict
+from pathlib import Path
+from typing import Any, TypedDict
 
 import numpy as np
 
@@ -26,7 +28,7 @@ except ImportError as e:  # pragma: no cover
         "Run from a project environment with lerobot installed."
     ) from e
 
-from ....core.pose_mapping import ClutchPoseMapper
+from ....core.pose_mapping import ClutchPoseMapper, mat_to_quat, quat_conj, quat_mul
 from ....quest import XRFrameClient, buttons as xr_buttons
 from ..model.kinematics import DEFAULT_Q_REST
 from ..ik.decoupled_ik import DecoupledIKSolver
@@ -44,6 +46,34 @@ NQ = 8  # arm (6) + 2 gripper-finger sliders
 # Gripper prismatic range from the URDF; both fingers share this qpos scale.
 GRIPPER_QPOS_OPEN = 0.001
 GRIPPER_QPOS_CLOSED = -0.045
+
+
+def _headset_relative_calibration(
+    base_r_calib: np.ndarray, viewer: dict | None
+) -> np.ndarray:
+    """Return Quest-world to arm-base rotation aligned to headset yaw."""
+    if viewer is None:
+        return base_r_calib.copy()
+    qx, qy, qz, qw = np.asarray(viewer["orientation"], dtype=float)
+    headset_rotation = np.array(
+        [
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+        ],
+        dtype=float,
+    )
+    forward = headset_rotation @ np.array([0.0, 0.0, -1.0])
+    forward[1] = 0.0
+    norm = float(np.linalg.norm(forward))
+    if norm < 1e-6:
+        return base_r_calib.copy()
+    forward /= norm
+    up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(forward, up)
+    # Columns are headset-local X/Y/Z expressed in Quest world coordinates.
+    headset_yaw = np.column_stack((right, up, -forward))
+    return base_r_calib @ headset_yaw.T
 
 
 @TeleoperatorConfig.register_subclass("bi_quest_teleop")
@@ -83,12 +113,14 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
 
     # EMA on the controller pose. 1.0 = raw; at 200 Hz, 0.5 ≈ 7 ms time constant.
     pose_filter_alpha: float = 0.8
+    # Rot cap must not exceed the follower's DEFAULT_MAX_RELATIVE_TARGET (0.15):
+    # a larger value lets the solver's qpos run away from the rate-clamped arm.
     max_dq_per_joint: list[float] | None = field(
-        default_factory=lambda: [0.06, 0.06, 0.06, 0.24, 0.24, 0.24]
+        default_factory=lambda: [0.06, 0.06, 0.06, 0.15, 0.15, 0.15]
     )
 
     max_dq_per_joint_scalar_pos: float = 0.06
-    max_dq_per_joint_scalar_rot: float = 0.24  # 4x position (48 rad/s @ 200 Hz)
+    max_dq_per_joint_scalar_rot: float = 0.15
 
     force_haptic_threshold_nm_left: float = 0.35
     force_haptic_threshold_nm_right: float = 0.35
@@ -98,6 +130,11 @@ class BiQuestTeleoperatorConfig(TeleoperatorConfig):
 
     # Go-home ramp: lerp qpos[:6] to rest_qpos_{hand} over this window.
     rest_ramp_duration_s: float = 2.0
+
+    # Open a Rerun viewer with raw XR poses and the commanded FK EE poses.
+    rerun_pose_debug: bool = False
+    # Raiden's measured transform between the two physical arm bases.
+    rerun_calibration_path: str = "~/.config/raiden/calibration_results.json"
 
 
 
@@ -122,6 +159,206 @@ class ArmState(TypedDict):
     logged_button_layout: bool
 
 
+class _RerunPoseLogger:
+    """Optional pose visualization kept separate from the control protocol."""
+
+    def __init__(self, r_calib: np.ndarray, calibration_path: str) -> None:
+        try:
+            import rerun as rr
+            import rerun.blueprint as rrb
+        except ImportError as exc:
+            raise ImportError(
+                "Rerun pose debugging requires rerun-sdk; install the project's "
+                "'debug' extra in robot-py312."
+            ) from exc
+
+        blueprint = rrb.Blueprint(
+            rrb.Spatial3DView(
+                origin="/world",
+                name="Quest and end-effector poses",
+            ),
+            auto_views=False,
+            auto_layout=False,
+        )
+        self._rr = rr
+        self._arrows_sent: set[str] = set()
+        self._r_calib = np.asarray(r_calib, dtype=float)
+        self._r_calib_quat = mat_to_quat(self._r_calib)
+        self._r_calib_quat_conj = quat_conj(self._r_calib_quat)
+        self._right_base_in_left = self._load_right_base_transform(calibration_path)
+        self._recording = rr.RecordingStream("yam_quest_pose_mapping")
+        # spawn() can't fail visibly when X is dead — the viewer process exits
+        # after the fact — so choose the sink by display presence up front.
+        import os
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            self._recording.spawn(default_blueprint=blueprint)
+        else:
+            uri = self._recording.serve_grpc(default_blueprint=blueprint)
+            rr.serve_web_viewer(open_browser=False, connect_to=uri)
+            logging.getLogger(__name__).warning(
+                "no display — rerun web viewer on http://<this-host>:9090 "
+                "(stream: %s)", uri)
+        # Rerun persists application layouts. Explicit activation replaces an
+        # older saved multi-panel blueprint instead of merely offering this as
+        # the default for a fresh viewer.
+        self._recording.send_blueprint(
+            blueprint,
+            make_active=True,
+            make_default=True,
+        )
+        self._recording.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+        self._log_pose(
+            "world/bases/left",
+            np.zeros(3),
+            [0.0, 0.0, 0.0, 1.0],
+            axis_length=0.12,
+            static=True,
+        )
+        if self._right_base_in_left is not None:
+            q = mat_to_quat(self._right_base_in_left[:3, :3])
+            self._log_pose(
+                "world/bases/right",
+                self._right_base_in_left[:3, 3],
+                [q[1], q[2], q[3], q[0]],
+                axis_length=0.12,
+                static=True,
+            )
+        self._tick = 0
+        # Log every Nth control tick: full rate saturates the SDK channel and
+        # the blocked sender then stalls get_action() under the teleop lock.
+        self.stride = 4
+
+    @staticmethod
+    def _load_right_base_transform(calibration_path: str) -> np.ndarray | None:
+        path = Path(calibration_path).expanduser()
+        try:
+            calibration = json.loads(path.read_text())
+            stored = np.asarray(
+                calibration["bimanual_transform"]["right_base_to_left_base"],
+                dtype=float,
+            )
+            if stored.shape != (4, 4) or not np.all(np.isfinite(stored)):
+                raise ValueError(f"expected a finite 4x4 matrix, got {stored.shape}")
+            # Raiden's field name is historical: the stored matrix maps left
+            # base into right base. Its verifier and converter invert it to
+            # place right-arm FK poses in the left-base world.
+            return np.linalg.inv(stored)
+        except (OSError, KeyError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
+            logger.warning(
+                "Rerun pose debug could not load Raiden bimanual calibration from %s: %s; "
+                "both arm bases will overlap",
+                path,
+                exc,
+            )
+            return None
+
+    def _xr_pose_in_arm_axes(
+        self, position: Any, quat_xyzw: Any
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Rotate an XR pose into arm axes; the XR origin remains untranslated."""
+        qx, qy, qz, qw = np.asarray(quat_xyzw, dtype=float)
+        quat_wxyz = np.array([qw, qx, qy, qz])
+        quat_arm = quat_mul(
+            quat_mul(self._r_calib_quat, quat_wxyz),
+            self._r_calib_quat_conj,
+        )
+        return (
+            self._r_calib @ np.asarray(position, dtype=float),
+            np.array([quat_arm[1], quat_arm[2], quat_arm[3], quat_arm[0]]),
+        )
+
+    def _log_pose(
+        self,
+        path: str,
+        position: Any,
+        quat_xyzw: Any,
+        *,
+        axis_length: float,
+        static: bool = False,
+    ) -> None:
+        rr = self._rr
+        self._recording.log(
+            path,
+            rr.Transform3D(
+                translation=np.asarray(position, dtype=float),
+                quaternion=rr.Quaternion(xyzw=np.asarray(quat_xyzw, dtype=float)),
+            ),
+            rr.TransformAxes3D(axis_length=axis_length, show_frame=True),
+            static=static,
+        )
+        # Static data resent per tick floods the SDK channel; once is enough.
+        if path in self._arrows_sent:
+            return
+        self._arrows_sent.add(path)
+        self._recording.log(
+            f"{path}/xyz",
+            rr.Arrows3D(
+                origins=np.zeros((3, 3)),
+                vectors=np.eye(3) * axis_length,
+                radii=[0.006, 0.006, 0.006],
+                colors=[[255, 0, 0], [0, 220, 0], [0, 128, 255]],
+                labels=["X", "Y", "Z"],
+                show_labels=True,
+            ),
+            static=True,
+        )
+
+    def _arm_pose_in_left_base(
+        self, hand: str, position: np.ndarray, quat_wxyz: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if hand != "right" or self._right_base_in_left is None:
+            return position, quat_wxyz
+        base_rotation = self._right_base_in_left[:3, :3]
+        base_quat = mat_to_quat(base_rotation)
+        return (
+            base_rotation @ position + self._right_base_in_left[:3, 3],
+            quat_mul(base_quat, quat_wxyz),
+        )
+
+    def log_frame(self, xr: dict, arms: dict[str, ArmState]) -> None:
+        self._tick += 1
+        if self._tick % self.stride:
+            return
+        self._recording.set_time("control_tick", sequence=self._tick)
+
+        viewer = xr.get("viewer")
+        if viewer is not None:
+            position, orientation = self._xr_pose_in_arm_axes(
+                viewer["position"], viewer["orientation"]
+            )
+            self._log_pose(
+                "world/xr/headset",
+                position,
+                orientation,
+                axis_length=0.15,
+            )
+
+        controllers = xr.get("controllers") or {}
+        for hand, ctrl in controllers.items():
+            if hand in arms and ctrl is not None:
+                position, orientation = self._xr_pose_in_arm_axes(
+                    ctrl["position"], ctrl["orientation"]
+                )
+                self._log_pose(
+                    f"world/xr/controllers/{hand}",
+                    position,
+                    orientation,
+                    axis_length=0.10,
+                )
+
+        for hand, arm in arms.items():
+            ee_pos, ee_quat_wxyz = arm["solver"].fk(arm["qpos"])
+            ee_pos, ee_quat_wxyz = self._arm_pose_in_left_base(
+                hand, ee_pos, ee_quat_wxyz
+            )
+            self._log_pose(
+                f"world/end_effectors/{hand}",
+                ee_pos,
+                [ee_quat_wxyz[1], ee_quat_wxyz[2], ee_quat_wxyz[3], ee_quat_wxyz[0]],
+                axis_length=0.08,
+            )
+
+
 class BiQuestTeleoperator(Teleoperator):
     config_class = BiQuestTeleoperatorConfig
     name = "bi_quest_teleop"
@@ -139,6 +376,8 @@ class BiQuestTeleoperator(Teleoperator):
             raise ValueError(
                 f"r_calib must be a 3x3 rotation matrix, got shape {self._r_calib.shape}"
             )
+        self._mapping_r_calib = self._r_calib.copy()
+        self._viewer_seen = False
 
         if not hands or any(hand not in ("left", "right") for hand in hands):
             raise ValueError(f"hands must contain left and/or right, got {hands!r}")
@@ -146,6 +385,8 @@ class BiQuestTeleoperator(Teleoperator):
         self._lock = threading.RLock()
         self._latest_xr_frame: dict | None = None
         self._last_xr_frame_time: float = 0.0
+        self._gap_samples: list[float] = []
+        self._gap_report_t: float = time.perf_counter()
 
         rest_qpos = {
             "left": np.asarray(config.rest_qpos_left, dtype=float),
@@ -212,6 +453,14 @@ class BiQuestTeleoperator(Teleoperator):
         # show the Δq-cap slider in honest rad/s.
         self._last_get_action_t: float | None = None
         self._loop_hz: float | None = None
+        self._pose_debug = (
+            _RerunPoseLogger(
+                self._r_calib,
+                config.rerun_calibration_path,
+            )
+            if config.rerun_pose_debug
+            else None
+        )
 
     # ---------- Teleoperator interface ----------
 
@@ -295,6 +544,23 @@ class BiQuestTeleoperator(Teleoperator):
         with self._lock:
             return any(self._buttons[hand]["handoff"] for hand in self._hands)
 
+    def xr_snapshot(self) -> dict | None:
+        """Latest raw XR frame plus engagement, for dataset debug logging.
+
+        Returns None before the first frame; otherwise {age_s, viewer,
+        controllers, engaged} with poses in Quest world coordinates as received.
+        """
+        with self._lock:
+            xr = self._latest_xr_frame
+            if xr is None:
+                return None
+            return {
+                "age_s": time.time() - self._last_xr_frame_time,
+                "viewer": xr.get("viewer"),
+                "controllers": xr.get("controllers") or {},
+                "engaged": {h: bool(self._arms[h]["engaged"]) for h in self._hands},
+            }
+
     def is_pause_pressed(self) -> bool:
         """Right-hand B — pause/resume the policy. Level only."""
         with self._lock:
@@ -356,9 +622,28 @@ class BiQuestTeleoperator(Teleoperator):
                 return self._build_action()
 
             gap_s = time.time() - last_frame_time
+            self._gap_samples.append(gap_s)
+            if now - self._gap_report_t > 10.0:
+                g = np.asarray(self._gap_samples)
+                logger.info(
+                    "xr stream health: age p50 %.0fms  p99 %.0fms  max %.0fms  "
+                    "stale(>50ms) %.1f%% of %d ticks",
+                    np.median(g) * 1e3, np.percentile(g, 99) * 1e3, g.max() * 1e3,
+                    (g > 0.05).mean() * 100, len(g))
+                self._gap_samples.clear()
+                self._gap_report_t = now
             ctrls = xr.get("controllers") or {}
+            viewer = xr.get("viewer")
+            self._viewer_seen = viewer is not None
+            self._mapping_r_calib = _headset_relative_calibration(self._r_calib, viewer)
             for hand in self._hands:
                 self._update_arm(hand, ctrls.get(hand), gap_s)
+
+            # This is deliberately inside get_action(), not the bridge's armed
+            # branch. Pose mapping can therefore be inspected while hardware
+            # commands remain disabled.
+            if self._pose_debug is not None:
+                self._pose_debug.log_frame(xr, self._arms)
 
             action = self._build_action()
 
@@ -418,12 +703,17 @@ class BiQuestTeleoperator(Teleoperator):
         # lags command by the tracking error. See DESIGN.md#teleoperation.
         ee_pos, ee_quat = arm["solver"].fk(arm["qpos"])
         j4_pos = arm["solver"].j4_anchor_xpos()
+        arm["mapper"].set_R(self._mapping_r_calib)
         arm["mapper"].engage(pos, quat_wxyz, ee_pos, ee_quat, pivot_armbase=j4_pos)
         arm["engaged"] = True
+        # rel = Hᵀ (headset-yaw frame); identity here with viewer=True means no correction.
+        rel = self._r_calib.T @ self._mapping_r_calib
+        yaw_deg = float(np.degrees(np.arctan2(rel[2, 0], rel[2, 2])))
         logger.info(
-            "%s clutch %s  ee_pos=%s  j4_pos=%s",
+            "%s clutch %s  ee_pos=%s  j4_pos=%s  headset_yaw=%.0f°  viewer=%s",
             hand, label, ee_pos.round(3),
             j4_pos.round(3) if j4_pos is not None else "—",
+            yaw_deg, self._viewer_seen,
         )
 
     def _advance_ramp(

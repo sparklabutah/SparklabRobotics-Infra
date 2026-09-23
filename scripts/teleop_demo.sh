@@ -2,11 +2,9 @@
 # Launch the YAM-Ultra teleop stack in one terminal: the relay (TLS, reused if
 # one is already on :8443), then the bimanual bridge in the foreground.
 #
-# Activate the environment holding this package first (conda activate
-# robot-py312); the check below fails fast if not.
-#
 #   ./scripts/teleop_demo.sh [args forwarded to teleop_bimanual.py]
 #   ./scripts/teleop_demo.sh --sim              # no hardware dry-run
+#   ./scripts/teleop_demo.sh --sim --rerun-poses # inspect XR and EE poses
 #   ./scripts/teleop_demo.sh --left-channel can_right --right-channel can_left
 #
 # Ctrl-C stops the bridge, ramping the arms home first, then tears down the
@@ -17,14 +15,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PKG="$ROOT/src/lerobot_robot_sparklab"
 WS_URL=wss://127.0.0.1:8443/ws
+PYTHON_BIN=${PYTHON_BIN:-/opt/miniforge/envs/robot-py312/bin/python}
 
-# Fail fast on the wrong env rather than deep inside an import.
-python - <<'PY' || { echo "[run] activate the env holding this package: conda activate robot-py312" >&2; exit 1; }
+# Use the target Conda interpreter and this checkout, regardless of the caller's
+# active shell environment.
+[[ -x "$PYTHON_BIN" ]] || {
+    echo "[run] Python not found: $PYTHON_BIN" >&2; exit 1; }
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+"$PYTHON_BIN" - <<'PY' || { echo "[run] dependencies missing from robot-py312" >&2; exit 1; }
 import importlib.util, sys
 sys.exit(0 if importlib.util.find_spec("lerobot_robot_sparklab") else 1)
 PY
-command -v sparklab-relay >/dev/null || {
-    echo "[run] sparklab-relay not on PATH — pip install -e . in the active env" >&2; exit 1; }
 LOG_DIR=/tmp/yam-teleop-logs
 mkdir -p "$LOG_DIR"
 
@@ -41,7 +42,7 @@ if curl -sk --max-time 2 -o /dev/null https://127.0.0.1:8443/; then
     echo "[run] relay already listening on :8443 — reusing it"
 else
     echo "[run] starting relay (log: $LOG_DIR/relay.log)"
-    setsid sparklab-relay --host 0.0.0.0 \
+    setsid "$PYTHON_BIN" -m lerobot_robot_sparklab.relay.server --host 0.0.0.0 \
         --cameras-yaml "$PKG/robots/yam_ultra/config/cameras.yaml" \
         --ssl-keyfile "$ROOT/key.pem" --ssl-certfile "$ROOT/cert.pem" \
         > "$LOG_DIR/relay.log" 2>&1 &
@@ -78,6 +79,6 @@ echo "[run] Quest browser → https://$LAN_IP:8443/"
 # ---- bridge (foreground; Ctrl-C ramps the arms home, twice skips it) --------
 echo "[run] starting bimanual bridge — B/Y arms/disarms, Ctrl-C exits"
 rc=0
-python "$PKG/robots/yam_ultra/teleop_bimanual.py" --ws-url "$WS_URL" "$@" || rc=$?
+"$PYTHON_BIN" "$PKG/robots/yam_ultra/teleop_bimanual.py" --ws-url "$WS_URL" "$@" || rc=$?
 echo "[run] bridge exited (rc=$rc) — cleaning up"
 exit "$rc"

@@ -50,7 +50,8 @@ they are up, or two control loops command the same motors.
 ## Running
 
 ```bash
-./scripts/start_arm_servers.sh          # --sim for i2rt SimRobots
+./scripts/start_arm_servers.sh          # real hardware
+./scripts/start_arm_servers.sh --sim    # SimRobots in live MuJoCo windows
 ```
 
 Default ports **11333** (left) / **11334** (right), channels `can_left` /

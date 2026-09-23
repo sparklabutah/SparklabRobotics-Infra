@@ -27,7 +27,8 @@ checkpoints.
 torque; everything else is a client of them.
 
     ./scripts/start_arm_servers.sh              # real hardware
-    ./scripts/start_arm_servers.sh --sim        # i2rt SimRobots, nothing moves
+    ./scripts/start_arm_servers.sh --sim        # SimRobots + live MuJoCo windows
+    ./scripts/start_arm_servers.sh --sim --no-viewer  # headless
 
 Ports and CAN channels are overridable:
 `LEFT_CHANNEL=can0 RIGHT_CHANNEL=can1 LEFT_PORT=11333 RIGHT_PORT=11334`.
@@ -39,10 +40,23 @@ Ports and CAN channels are overridable:
 **3. Teleoperate**, no recording:
 
     ./scripts/teleop_demo.sh
+    ./scripts/teleop_demo.sh --rerun-poses  # XR + commanded EE pose debug
+
+The shared Rerun view updates while the bridge is DISARMED; only XR frames from
+the headset are required. XR poses are rotated into arm-base axes, and Raiden's
+`~/.config/raiden/calibration_results.json` places the right arm in the left
+arm's frame. The XR and left-arm origins still coincide because Raiden has no
+Quest-to-arm translation calibration.
 
 **4. Record a dataset.**
 
-    ./scripts/record.sh
+    ./scripts/record.sh              # timed episodes, voice-guided resets
+    ./scripts/record_manual.sh       # operator-keyed episodes
+
+`record_manual.sh` ignores the episode/reset timers: space or the Quest B/Y
+button starts and ends each episode (saved on end, then the arms park to
+zeros), `r` discards the one in progress, `q`/Esc exits. Stats reprint at every episode start; extra flags pass
+through to the underlying CLI.
 
 ## …run a policy
 

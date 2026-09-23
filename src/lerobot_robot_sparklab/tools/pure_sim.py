@@ -40,6 +40,8 @@ def main() -> None:
                     help="teleop id stamped into ik_state broadcasts, so a "
                          "listener can pick one stream when several sims share "
                          "a relay")
+    ap.add_argument("--rerun-poses", action="store_true",
+                    help="spawn a Rerun viewer showing headset/controller/EE poses")
     add_ik_cli_args(ap)
     args = ap.parse_args()
 
@@ -67,6 +69,7 @@ def main() -> None:
         ws_url=args.ws_url,
         rest_qpos_left=rest_left,
         rest_qpos_right=rest_right,
+        rerun_pose_debug=args.rerun_poses,
         **ik_overrides,
     ))
 

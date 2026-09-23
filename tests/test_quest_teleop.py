@@ -1,11 +1,17 @@
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 
 from lerobot_robot_sparklab.robots.yam_ultra.teleop.bi_quest_teleop import (
     BiQuestTeleoperator,
     BiQuestTeleoperatorConfig,
+    _RerunPoseLogger,
+    _headset_relative_calibration,
 )
 
 
@@ -60,6 +66,68 @@ class QuestTeleopStateTest(unittest.TestCase):
 
         self.assertFalse(arm["ramp_active"])
         self.assertTrue(arm["needs_reanchor"])
+
+    def test_pose_debug_runs_without_an_armed_state(self) -> None:
+        teleop = self.make_single()
+        pose_debug = Mock()
+        teleop._pose_debug = pose_debug
+        teleop._latest_xr_frame = {
+            "viewer": {"position": [0, 1.7, 0], "orientation": [0, 0, 0, 1]},
+            "controllers": {
+                "right": {
+                    "position": [0.2, 1.2, -0.4],
+                    "orientation": [0, 0, 0, 1],
+                    "buttons": [],
+                }
+            },
+        }
+        teleop._last_xr_frame_time = time.time()
+
+        teleop.get_action()
+
+        pose_debug.log_frame.assert_called_once_with(
+            teleop._latest_xr_frame, teleop._arms
+        )
+
+    def test_raiden_bimanual_transform_is_inverted_for_left_base_world(self) -> None:
+        stored = np.eye(4)
+        stored[:3, 3] = [0.04, 0.56, 0.01]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration_results.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "bimanual_transform": {
+                            "right_base_to_left_base": stored.tolist()
+                        }
+                    }
+                )
+            )
+
+            right_base_in_left = _RerunPoseLogger._load_right_base_transform(
+                str(path)
+            )
+
+        np.testing.assert_allclose(right_base_in_left, np.linalg.inv(stored))
+
+    def test_headset_yaw_maps_head_forward_to_robot_forward(self) -> None:
+        yaw = np.pi / 2
+        viewer = {
+            "orientation": [0.0, np.sin(yaw / 2), 0.0, np.cos(yaw / 2)]
+        }
+        base_r_calib = np.array(
+            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        )
+
+        calibrated = _headset_relative_calibration(base_r_calib, viewer)
+
+        head_forward_in_quest = np.array([-1.0, 0.0, 0.0])
+        np.testing.assert_allclose(
+            calibrated @ head_forward_in_quest,
+            [1.0, 0.0, 0.0],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(calibrated @ calibrated.T, np.eye(3), atol=1e-12)
 
 
 if __name__ == "__main__":

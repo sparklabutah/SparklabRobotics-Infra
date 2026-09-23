@@ -56,11 +56,12 @@ read, so the robot looks healthy while every command goes nowhere.
 
 ## Teleoperation
 
-**The frame is ground-referenced and fixed.** Controller deltas are rotated
-into the arm base by `r_calib` alone; the headset pose is never read, so the
-operator does not have to wear it. WebXR `local-floor` is already Y-up with the
-origin on the floor. "Forward" is whichever way the operator faced at session
-start, so re-centre the headset if forward ends up wrong.
+**The frame is ground-referenced and headset-yaw aligned.** WebXR `local-floor`
+is Y-up with the origin on the floor. At every clutch anchor, headset yaw is
+composed with `r_calib`, so controller-forward follows the direction the
+operator is facing. Pitch and roll are discarded, and turning the head while
+the clutch remains held does not move the arm; the new yaw takes effect at the
+next engage or re-anchor.
 
 **The clutch re-anchors on every engage**, capturing both the controller pose
 and the arm's current EE pose, so motion always resumes from where the arm

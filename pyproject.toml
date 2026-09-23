@@ -39,6 +39,10 @@ realsense = [
 yam-ultra = [
     "portal>=3.7",
 ]
+# Optional desktop pose viewer for Quest-to-IK mapping diagnostics.
+debug = [
+    "rerun-sdk>=0.33.1",
+]
 
 [project.scripts]
 sparklab-relay = "lerobot_robot_sparklab.relay.server:main"

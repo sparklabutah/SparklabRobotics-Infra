@@ -61,3 +61,4 @@ Thumbs.db
 
 # Build artifact from sparklab_sim.convert, derived from the vendored URDF.
 src/lerobot_robot_sparklab/robots/yam_ultra/model/usd/
+hf_dataset/

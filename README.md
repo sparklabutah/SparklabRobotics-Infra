@@ -61,7 +61,8 @@ The arm servers own the CAN loop and the torque. Start them first and leave
 them running; everything else is a client of them.
 
 ```bash
-./scripts/start_arm_servers.sh          # --sim for i2rt SimRobots
+./scripts/start_arm_servers.sh          # real hardware
+./scripts/start_arm_servers.sh --sim    # SimRobots in live MuJoCo windows
 
 # then one of:
 ./scripts/teleop_demo.sh                # VR teleoperation

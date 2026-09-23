@@ -242,6 +242,7 @@ class YamUltraFollower(Robot):
         """
         import ctypes
         import signal
+        import socket
         import subprocess
         import sys
 
@@ -253,6 +254,15 @@ class YamUltraFollower(Robot):
         specs = [(self.config.left_channel, self.config.left_server_port),
                  (self.config.right_channel, self.config.right_server_port)]
         for channel, port in specs:
+            try:
+                with socket.create_connection((self.config.server_host, port), timeout=0.2):
+                    pass
+            except OSError:
+                pass
+            else:
+                logger.info("reusing existing SIM arm_server for %s on port %d",
+                            channel, port)
+                continue
             logger.info("spawning SIM arm_server for %s on port %d", channel, port)
             self._sim_servers.append(subprocess.Popen(
                 [sys.executable, "-m", "lerobot_robot_sparklab.robots.yam_ultra.arm_server",
