@@ -10,6 +10,35 @@ First robot: the bimanual [i2rt YAM-Ultra](https://github.com/i2rt-robotics/i2rt
 Design rationale, measured constraints and the reasoning behind the layout are
 in [`DESIGN.md`](DESIGN.md).
 
+## System at a glance
+
+```mermaid
+flowchart LR
+    Q[Meta Quest<br/>WebXR controllers] <-->|TLS + WebSocket| R[Pose and camera relay]
+    R --> T[Quest teleoperator]
+    T --> D[Teleop, recording,<br/>or DAgger correction]
+
+    H[Agent harness<br/>and browser UI] --> L[Live rollout]
+    P[VLA policy] --> L
+    D --> F[YAM bimanual follower]
+    L --> F
+
+    F --> AS1[Left arm server]
+    F --> AS2[Right arm server]
+    AS1 --> A1[Left YAM-Ultra]
+    AS2 --> A2[Right YAM-Ultra]
+
+    L -. simulation target .-> I[Isaac policy server<br/>and digital twin]
+    C[RealSense cameras] --> R
+    C --> D
+    C --> L
+```
+
+The arm servers are the only processes that touch CAN or own motor torque.
+The relay, teleoperator, recorder, rollout, and harness remain replaceable
+clients. A camera can have only one owner at a time: the relay owns it for
+teleop preview, while recording and rollout open it through the robot client.
+
 ## Layout
 
 ```
@@ -37,7 +66,7 @@ differs.
 ## Install
 
 ```bash
-conda create -n sparklab python=3.12 && conda activate sparklab
+conda create -n robot-py312 python=3.12 && conda activate robot-py312
 pip install -e ".[relay,realsense,yam-ultra]"
 
 # i2rt (YAM arm driver — not on PyPI):
@@ -48,9 +77,17 @@ git clone https://github.com/i2rt-robotics/i2rt && pip install -e ./i2rt
 conda install -c conda-forge ffmpeg
 ```
 
-`lerobot>=0.6` requires Python ≥3.12. Always `conda activate` rather than
-calling the interpreter by path — the activation hook sets `LD_LIBRARY_PATH`,
-without which `torchcodec` fails to load.
+`lerobot>=0.6` requires Python ≥3.12. `start_arm_servers.sh`,
+`teleop_demo.sh`, and `record_manual.sh` default to
+`/opt/miniforge/envs/robot-py312/bin/python`; set `PYTHON_BIN` if the environment
+lives elsewhere. Activate the environment before direct `lerobot-*` commands
+so its `LD_LIBRARY_PATH` is present for `torchcodec`.
+
+Pose visualization is optional:
+
+```bash
+pip install -e ".[debug]"
+```
 
 Sim work uses no conda environment at all: Isaac ships its own Python. Run it
 through `./scripts/isaac_python.sh`.
@@ -66,11 +103,35 @@ them running; everything else is a client of them.
 
 # then one of:
 ./scripts/teleop_demo.sh                # VR teleoperation
-./scripts/record.sh                     # teleop dataset recording
+./scripts/teleop_demo.sh --rerun-poses  # VR + live XR/EE pose diagnostics
+./scripts/record_manual.sh              # operator-keyed dataset recording
 ./scripts/rollout.sh                    # policy on the real arms
 ./scripts/rollout.sh --mode=live        # ... plus a control port
-./scripts/harness.sh                    # ... plus an agent + web UI on :8099
+
+# after starting a live rollout, in another terminal:
+./scripts/harness.sh                    # agent + web UI on :8099
 ```
+
+```mermaid
+flowchart TD
+    E{Execution target} -->|Real YAM arms| S[Start arm servers]
+    E -->|Isaac twin| I[Start Isaac policy server]
+    S --> W{What are you doing?}
+    W -->|Drive with Quest| T[teleop_demo.sh]
+    W -->|Collect demonstrations| M[record_manual.sh]
+    W -->|Run a policy| P[rollout.sh]
+    P --> A{Need live retargeting<br/>or an agent?}
+    A -->|No| B[Base rollout]
+    A -->|Retarget from CLI| C[--mode=live<br/>sparklab-rollout-ctl]
+    A -->|Agent + web UI| H[--mode=live<br/>harness.sh]
+    I --> SI[rollout.sh --robot=sim]
+```
+
+`record_manual.sh` starts or reuses a camera-free relay. Press Space or Quest
+B/Y to start or save an episode, `r` to discard it, and `q` or Esc to exit.
+For fixed-duration, voice-guided episodes, start a camera-free relay yourself
+and use `record.sh` instead. Do not let the relay and recorder open the same
+RealSense cameras simultaneously.
 
 `./scripts/rollout.sh --dry-run` prints the command it would run without
 running it. Do not run `teleop_demo.sh` while a rollout is up — that would put
@@ -84,7 +145,8 @@ two control loops on the same motors.
 | `rollout.sh` | **the policy entry point.** `--robot=hw\|sim`, `--policy=finetuned\|stock\|stock-typed`, `--mode=base\|dagger\|live` |
 | `harness.sh` | web UI + high-level agent on top of `--mode=live` |
 | `teleop_demo.sh` | relay + bimanual VR bridge in one terminal |
-| `record.sh` | teleop dataset recording via `lerobot-record` |
+| `record_manual.sh` | operator-keyed recording with save/discard controls and XR metadata |
+| `record.sh` | fixed-duration, voice-guided recording via `lerobot-record` |
 | `can_health.sh` | SocketCAN fault counters — separates a wire problem from a host-timing one |
 | `make_certs.sh` | the self-signed TLS cert the relay serves to the Quest |
 | `isaac_python.sh` | run anything under Isaac's bundled Python |
