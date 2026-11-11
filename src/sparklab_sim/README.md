@@ -1,153 +1,118 @@
 # sparklab_sim
 
-Isaac Sim digital twin of the lab's rigs. **Kinematic, not dynamic**: it poses
-arms and renders cameras; it does not simulate contact, torque or grasping.
+Isaac Sim copies of the rig. Two entry points:
+
+- **`twin.py`, the digital twin.** The calibrated rig with physics, behind the real
+  rig's ROS 2 interface. Anything that drives the rig (cap-x, VLM_TAMP) drives the
+  twin unchanged, on another ROS domain.
+- **`policy_server.py`.** An HTTP server for LeRobot's `yam_ultra_sim` robot. It poses
+  the arms in the older hand-authored `scene.usda`.
+
+Both run on Isaac's own Python (Isaac Sim 5.1 in the `behavior` conda env), so this is
+not a ROS package (note the `COLCON_IGNORE`). It reads the arm model and rig config
+straight from `sparklab_yam`'s and `capx_sparklab`'s folders (`paths.py`).
 
 ```
-paths.py         locate shared assets in the sibling package, by path
-rig.py           measured table layout — what is MEASURED vs ASSUMED
-convert.py       URDF -> USD, run once
-scene.py         build the scene, pose arms, place/move cameras
-render.py        camera -> ndarray, side-by-side, diff metric
-rigcams.py       the rig's camera set, matched to the real intrinsics
-capture.py       on-demand capture server
-viewport.py      interactive viewport: MJPEG out, mouse in (used by live.py)
-live.py          edit the .usda, orbit it in a browser, over SSH
-policy_server.py HTTP server the `yam_ultra_sim` robot talks to
+twin.py           the digital twin: build the stage, serve the rig's ROS 2 interface
+twin_scene.py     the twin's stage: arms at their calibrated bases, cameras, props; FK
+looks.py          the twin's colours, light, room and cardboard box
+calibration.py    the rig as calibrated: extrinsics.yaml, cameras.yaml, intrinsics.yaml
+objects.py        BEHAVIOR-1K objects, decrypted once into ~/.cache/sparklab_sim/objects
+convert.py        URDF -> USD, run once (--twin: the twin's arm, with collisions)
+policy_server.py  HTTP server that LeRobot's yam_ultra_sim robot talks to
+scene.py          policy server's scene: pose the arms, place cameras
+rig.py            policy server's table and camera layout (MEASURED or ASSUMED)
+rigcams.py        policy server's cameras
+render.py         camera -> image array, image diff
+live.py           edit the policy server's scene file and watch it in a browser
+viewport.py       the browser view used by live.py
+capture.py        on-demand capture server
+paths.py          where the shared model, config and object files are
+test/             the twin's geometry against the driver's; runs without Isaac
 ```
 
-Everything here runs under Isaac's bundled Python, which has no `lerobot` —
-that is the only reason this package is separate, and it makes the boundary a
-mechanical test: *a module that imports lerobot does not belong here.* Shared
-assets are read by path out of the sibling package (`paths.py`). The rollout
-runner lives on the other side of that line, in
-[`../lerobot_robot_sparklab/rollout/`](../lerobot_robot_sparklab/rollout/). See
-[`DESIGN.md`](../../DESIGN.md#package-boundaries).
+## The digital twin
 
-## Running
-
-There is no conda env to activate, and you should not be in one. The wrapper
-drops any active env and puts `<repo>/src` on `PYTHONPATH`:
+Don't activate a conda env; the wrapper sets up Isaac's Python and its bundled ROS 2:
 
 ```bash
-./scripts/isaac_python.sh -m sparklab_sim.convert        # URDF -> USD, once
+./scripts/isaac_python.sh -m sparklab_sim.convert --twin    # once, and after capx_sparklab.robot.build
+./scripts/isaac_python.sh -m sparklab_sim.twin              # serves on ROS domain 42
+ROS_DOMAIN_ID=42 ./scripts/capx_python.sh -m capx_sparklab.agent
+```
+
+Flags: `--domain N` serves another domain; `--gui` opens Isaac's window. Startup takes
+under a minute (longer the first time, while shaders compile).
+
+It serves what the two drivers, the camera node and the launch's static TF serve,
+with the same names, frames and units:
+
+| topic / service | as on the rig |
+|---|---|
+| `/<arm>/joint_states` | `joint_1`..`joint_6` + `gripper` (1 open .. 0 closed), 120 Hz |
+| `/<arm>/ee_pose`, `/tf` `<arm>_base` → `<arm>_tool0` | the driver's FK of the joint states |
+| `/<arm>/arm/command`, `/<arm>/gripper/command` | clamped to `max_step` from `yam.yaml` |
+| `/<arm>/park` | ramps to zero over `park_duration_s`; answers at once rather than after |
+| `/<arm>/zero_gravity` | refused, as a SimRobot does |
+| `/cameras/<id>/{color,depth}/image_raw` | rgb8, and 16UC1 mm aligned to colour, one stamp, 8 Hz |
+| `/cameras/<id>/{color,depth}/camera_info` | the real intrinsics, distortion zero |
+| `/tf_static` | `extrinsics.yaml` |
+
+Beyond the rig, for scoring practice runs only: `/tf` `left_base` → `twin/<prop>`, each
+prop's true pose. Nothing that drives the robot may read it.
+
+The world is `left_base`. The table top is 1.5 cm below the bases. The arms are
+`capx_sparklab`'s robot model, the one cuRobo plans with: i2rt's stock gripper. Arm
+links feel no gravity, as under the drivers' gravity compensation; the joints use the
+real motors' PD gains, and the fingers keep a held object centred, as the gripper's rack does.
+
+**Props.** `twin_scene.DEFAULT_PROPS` lists five BEHAVIOR-1K objects within top-down
+reach (a marker, a soda can, a bowl, an apple, a mug), plus the open cardboard box and
+the back rail from `looks.py`. A `Prop` names a BEHAVIOR-1K category and an (x, y) in
+`left_base`; it is dropped onto the table and settles. The dataset lives in
+`~/BEHAVIOR-1K` (override with `BEHAVIOR_1K=`).
+
+## The policy server
+
+```bash
+./scripts/isaac_python.sh -m sparklab_sim.convert                         # once
 ./scripts/isaac_python.sh -m sparklab_sim.policy_server --port 8081 --physics
-./scripts/isaac_python.sh my_script.py
-./scripts/isaac_python.sh                                # REPL
+./scripts/rollout.sh --robot=sim                                          # then, elsewhere
 ```
 
-Safe to call from inside `robot-py312` — it deactivates first. Point at another
-install with `ISAAC=/path/to/...`.
+Use `--physics` whenever objects are touched; without it the gripper can't hold
+anything. Leave the server running between rollouts; it parks the arms by itself
+after 45 s idle. It was written against Isaac 6.0 and has not been rerun on 5.1.
 
-`--physics` is required for anything involving **contact**. Without it the
-fingers teleport and cannot hold an object, so every grasp fails regardless of
-the policy.
-
-## Editing the scene over SSH
+## Editing the policy server's scene
 
 ```bash
-./scripts/isaac_python.sh -m sparklab_sim.live      # -> http://127.0.0.1:8080/
+./scripts/isaac_python.sh -m sparklab_sim.live      # open http://127.0.0.1:8080/
 ```
 
-Drag to orbit, wheel to zoom, shift-drag to pan. Edit `sim/scene.usda` in any
-editor and save; the view follows in ~0.3 s. `.usda` is ASCII, so moving a prim
-is editing its `xformOp:translate`. The camera dropdown switches between free
-look and the scene's authored cameras. `copy pose` puts the current view on the
-clipboard as a `set_orbit_camera(...)` call, which is how a view you liked
-becomes a number in `rig.py`.
+Drag to orbit, scroll to zoom, shift-drag to pan. Edit
+`sparklab_yam/sparklab_yam/sim/scene.usda` in any editor and save; the view
+updates in about 0.3 s. `copy pose` copies the current view as code for `rig.py`.
+Useful flags: `--once --out x.png` (one snapshot), `--regenerate` (rebuild from
+`rig.py`, **discarding your edits**).
 
-Flags: `--play` streams continuously, `--res` sets free-look resolution,
-`--once --out x.png` takes a headless snapshot, `--reopen` forces full stage
-reopens, `--regenerate` rebuilds the scene from `rig.py` **discarding your
-edits**. `/frame.jpg` is a single still for scripting.
-
-In VS Code over SSH the port forwards itself — check the **Ports** panel.
-`--host 0.0.0.0` serves to the network instead.
-
-**Call `Renderer.close()` before reopening a stage**, or the next update
-segfaults. The sublayer reload scheme that makes an edit cost ~0.04 s is
-described in [`DESIGN.md`](../../DESIGN.md#the-live-viewers-fast-path).
-
-## Live view from a notebook
-
-For tweaking driven by Python rather than by the file:
-
-```python
-from sparklab_sim import render, viewport
-
-r  = render.Renderer(app, scene.CAMERA_PRIM)     # build ONCE
-vp = viewport.Viewport(port=8890); vp.start()    # -> http://127.0.0.1:8890/
-
-scene.set_camera(stage, standoff=1.3, height=0.9, pitch_deg=-25)
-vp.publish(r.frame(settle=4))                    # tab updates
-```
-
-Reuse the `Renderer` and `set_camera`; do not rebuild the stage. Isaac costs
-~15 s to boot and holds the GPU, so a warm kernel mutating the camera iterates
-in seconds. Call `r.close()` before opening another stage.
-
-`render.abs_diff` returns mean absolute error in 0-255. Two renders of an
-unchanged scene differ by **MAE ≈ 0.8** from RTX temporal sampling — that is
-the noise floor, so a camera fit scoring below it is done. Raise `settle` for a
-quieter image.
-
-## Notebooks in VS Code over SSH
-
-Isaac's own kernelspec does not work in VS Code, which launches kernels itself
-and so fails with `ModuleNotFoundError: No module named 'isaacsim'`. Install
-the self-contained kernel, which bakes the resolved environment and this repo's
-`src/` into `kernel.json`:
+## Notebooks
 
 ```bash
-./scripts/install_isaac_kernel.sh          # re-run if Isaac or the repo moves
+./scripts/install_isaac_kernel.sh      # once
 ```
 
-Then, in the **remote** window (extensions are per-host): install the Python and
-Jupyter extensions, open a notebook, and pick **Select Kernel → Jupyter
-Kernel... → SparkLab Isaac Sim (3.12)**. Not **Python Environments...**, which
-lists conda interpreters, none of which can run Isaac.
+Then in VS Code pick **Select Kernel → Jupyter Kernel → SparkLab Isaac Sim**.
+If it doesn't appear, run `./scripts/start_isaac_jupyter.sh` and connect to the
+printed URL. The kernel holds the GPU while it's alive.
 
-If the kernel refuses to appear, run `./scripts/start_isaac_jupyter.sh` and use
-**Select Kernel → Existing Jupyter Server...** with the printed tokenised URL.
+## Gotchas
 
-No X server is needed — the app runs `headless=True` and frames come back
-through Replicator as arrays. First launch is ~15 s warm, several minutes the
-very first time while RTX shaders compile. The kernel holds the GPU for as long
-as it is alive, so interrupt it before starting another Isaac process.
-`app.close()` kills the kernel; that is expected, not a crash.
-
-## Constraints to know
-
-- **`SimulationApp` must be constructed before any `omni.*` / `isaacsim.*`
-  import.** Those modules do not exist until Kit has booted, which is why every
-  Isaac import here sits inside a function, never at module scope.
-- **Placing an imported arm needs USD xform ops on the reference prim**, not
-  `Articulation.set_world_poses`, and it must happen before the timeline plays:
-  the asset is imported `fix_base=True`, so on the first physics step each arm
-  welds to the world wherever it stands. Get this wrong and both arms silently
-  stack at the origin.
-- **Joint writes need the timeline playing.** `set_dof_positions` asserts
-  "physics tensor entity is not valid" until then; `scene.start()` plays it.
-- **Gravity is off on purpose.** The URDF ships no joint drive gains, so under
-  gravity the joints sag out of any pose written to them.
-- **Link paths carry a `Geometry` scope** — `<arm>/Geometry/base/link1/...`.
-  Use `scene.link_path()`; it has changed once already.
-
-## The USD is a build artifact
-
-`convert.py` writes `robots/yam_ultra/model/usd/`, which is gitignored. It
-derives from the vendored `yam_ultra.urdf`, not i2rt's installed copy.
-
-Verified after conversion: all six joint limits survive into the USD (stored in
-degrees — `joint3` reads `171.88734°` = 3.0 rad), and forward kinematics agree
-with the MuJoCo model to **0.4 mm**.
-
-## What is still missing
-
-`rig.py` marks every value MEASURED or ASSUMED. Measured: arm separation
-(0.60 m centre-to-centre) and that the third-person camera is laterally
-centred. Assumed: arm yaw, camera standoff/height/pitch, table size.
-
-**Wrist camera extrinsics are absent entirely** — the URDF has no camera links
-and no hand-eye calibration has been done. That calibration is the prerequisite
-for comparing rendered frames against recorded ones.
+- Create `SimulationApp` before importing anything from `omni.*` / `isaacsim.*`.
+- Call `Renderer.close()` before opening another stage, or Isaac crashes.
+- Kit drops unflushed stdout when it closes: `print(..., flush=True)`.
+- The policy server keeps gravity off on purpose: its URDF has no joint gains, so arms would sag.
+- Two renders of the same scene differ by about 0.8 (mean abs. error, 0–255);
+  that's the noise floor.
+- In the URDF a finger joint at 0 is **closed**; open is −0.04695.
+- `convert.py` writes `sparklab_yam/sparklab_yam/model/usd/` (gitignored).
