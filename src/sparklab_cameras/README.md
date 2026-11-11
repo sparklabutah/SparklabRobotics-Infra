@@ -1,64 +1,52 @@
 # sparklab_cameras
 
-The RealSense cameras on ROS 2, plus a few tools you run by hand to set them up.
-Which cameras exist is configured per robot, in
-[`sparklab_yam/config/cameras.yaml`](../sparklab_yam/config/README.md).
+The RealSense cameras on ROS 2, plus tools to set them up. Which cameras exist is
+set in [`sparklab_yam/config/cameras.yaml`](../sparklab_yam/config/README.md).
+
+```mermaid
+flowchart LR
+    rs([3 RealSense cameras]) -->|USB| cams[cameras]
+    cams -->|"/cameras/*/color/image_raw<br/>/cameras/*/depth/image_raw<br/>/cameras/*/*/camera_info<br/>/cameras/*/points"| users["quest_bridge, LeRobot,<br/>agents, Foxglove"]
+```
 
 ```
-sparklab_cameras/node.py               ROS node: publishes every camera
-sparklab_cameras/apply_presets.py      load saved camera settings onto the hardware
+sparklab_cameras/node.py               the camera node
+sparklab_cameras/apply_presets.py      load saved settings onto the cameras
 sparklab_cameras/calibrate.py          try exposure / white balance / gain values
-sparklab_cameras/export_intrinsics.py  save every camera's intrinsics to a YAML file
+sparklab_cameras/export_intrinsics.py  save every camera's intrinsics to YAML
 ```
 
 ## The camera node
 
-```bash
-ros2 run sparklab_cameras cameras --ros-args -p rig:=src/sparklab_yam/config/cameras.yaml
-```
-
-The launch file starts it for you. This node is the only thing that opens the
-cameras — the headset bridge and LeRobot just subscribe. A camera that can't be
-opened is skipped with an error in the log.
-
-Each camera publishes these topics, all with the same timestamp:
+`yam.launch.py` starts it. It is the only thing that opens the cameras; everything
+else subscribes. A camera that can't be opened is skipped with an error.
 
 | topic | type | |
 |---|---|---|
-| `/cameras/<id>/color/image_raw` | `Image` `rgb8` | colour image |
-| `/cameras/<id>/depth/image_raw` | `Image` `16UC1` | depth in **millimetres**, 0 = no reading |
-| `/cameras/<id>/color/camera_info` | `CameraInfo` | intrinsics (focal length, centre, distortion) |
-| `/cameras/<id>/depth/camera_info` | `CameraInfo` | the same intrinsics |
-| `/cameras/<id>/points` | `PointCloud2` | xyz (m) + rgb in the camera frame, every 4th pixel, ≤ 10 Hz |
+| `/cameras/<id>/color/image_raw` | `Image` `rgb8` | colour |
+| `/cameras/<id>/depth/image_raw` | `Image` `16UC1` | depth in **mm**, 0 = no reading |
+| `/cameras/<id>/{color,depth}/camera_info` | `CameraInfo` | intrinsics |
+| `/cameras/<id>/points` | `PointCloud2` | xyz (m) + rgb, ≤ 10 Hz, only while something subscribes |
 
-Depth is **aligned to colour**: same size, and pixel (u, v) in the depth image
-is the same point as pixel (u, v) in the colour image. That's why both share
-one set of intrinsics. `frame_id` is the camera id. The point cloud is only
-built while something subscribes to it, and corrects for lens distortion.
+Depth is aligned to colour: pixel (u, v) is the same point in both, so they share
+intrinsics. `frame_id` is the camera id.
 
-## Freezing camera settings
+## Camera settings
 
-Auto-exposure flickers during recording, so settings are fixed once. Pick
-**one** of these per camera:
+Settings are fixed so auto-exposure doesn't flicker in recordings. Per camera, either:
 
-**A saved preset** (what the rig uses). Save settings from `realsense-viewer`,
-point the camera's `advanced_json` at the file, and load it after each power-up:
+- **a saved preset** (what the rig uses): save it from `realsense-viewer`, point the
+  camera's `advanced_json` at it, and load it after each power-up:
 
-```bash
-ros2 run sparklab_cameras apply_presets src/sparklab_yam/config/cameras.yaml
-```
+  ```bash
+  ros2 run sparklab_cameras apply_presets src/sparklab_yam/config/cameras.yaml
+  ```
 
-**Three values in the camera file** — `exposure`, `white_balance`, `gain`. The
-camera node applies them on every start. Find good values with:
-
-```bash
-ros2 run sparklab_cameras calibrate --serial 323622272781
-```
+- **three values** in `cameras.yaml` (`exposure`, `white_balance`, `gain`), applied
+  on every start. Find them with `ros2 run sparklab_cameras calibrate --serial <serial>`.
 
 ## Intrinsics
 
 ```bash
 ros2 run sparklab_cameras export_intrinsics intrinsics.yaml
 ```
-
-Only needed for 3D work; policies that use raw pixels don't need it.

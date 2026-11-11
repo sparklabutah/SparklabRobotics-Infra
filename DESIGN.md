@@ -427,6 +427,10 @@ reboot. Reopening the root layer deletes the render products and segfaults,
 hence `Renderer.close()`. The timeline is always playing (joint writes need it),
 so a reload bounces it to reset physics-owned objects.
 
+**Gravity off in the policy server.** Its URDF has no joint gains, so under gravity
+the arms would sag. Two renders of the same scene differ by about 0.8 (mean absolute
+error, 0–255): that is the noise floor for image comparisons.
+
 **Not Isaac's WebRTC stream**: it has no browser client here, needs extra ports,
 and uses UDP, which SSH tunnels can't carry. The MJPEG view is one TCP port.
 
@@ -764,6 +768,9 @@ The gripper moves after the arm arrives, the order a grasp needs.
 - **RTC inference needs `n_action_steps / fps > inference time`**, or whole
   chunks get dropped and the arm doesn't move. Sync inference instead pauses
   the loop ~275 ms every 30 ticks.
+- **Some checkpoints call the wrist cameras `left`/`right`**, not
+  `left_wrist`/`right_wrist`, so `rollout.sh` adds `--rename_map` for the
+  `--policy` choices that need it.
 - **Validate a checkpoint offline first** with
   `scripts/analysis/validate_policy_pipeline.py`.
 
