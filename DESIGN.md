@@ -152,6 +152,19 @@ converted to millimetres (ROS's convention for 16-bit depth) because the
 cameras disagree on units: 1 mm on the D435F, 0.1 mm on the D405s. All three
 sustain colour + depth at full rate, the D405s even on USB 2.1.
 
+**Wrist exposure: 8 ms at gain 64.** A D405's frame rate drops to fit its
+exposure. Streaming both wrists together on 2026-11-12, `hand_default.json`'s
+original 89.8 ms gave 6 fps and blew out the white board; 33 ms gave 15 fps,
+and anything up to 16 ms held 30 fps with no skipped frames. Brightness follows
+exposure × gain: 8 ms at gain 64 (63/77 of 255) keeps the board's holes, while
+gain 96 starts to clip them and 128 loses them. A short exposure is the point:
+under auto-exposure the wrists recorded at about 30 ms, which smeared every
+frame of a fast arm move, and the darker right wrist dropped to 15 fps.
+A preset lives in the camera's memory only until it loses power: after the
+rig rebooted, all three cameras were silently back on auto-exposure because
+nobody had rerun `apply_presets`. So the camera node now loads every preset as
+it starts, before opening the camera.
+
 **Image speed.** Assigning `bytes` to `Image.data` takes ~90 ms for a 720p
 frame (rclpy copies it element by element) and capped the top camera near
 4 Hz. Assigning an `array.array('B')` takes 0.1 ms; with it all three cameras

@@ -35,8 +35,9 @@ intrinsics. `frame_id` is the camera id.
 
 Settings are fixed so auto-exposure doesn't flicker in recordings. Per camera, either:
 
-- **a saved preset** (what the rig uses): save it from `realsense-viewer`, point the
-  camera's `advanced_json` at it, and load it after each power-up:
+- **a saved preset** (what the rig uses): save it from `realsense-viewer` and point the
+  camera's `advanced_json` at it. The camera node loads it every time it starts. To load
+  the presets without starting the node, while it is stopped:
 
   ```bash
   ros2 run sparklab_cameras apply_presets src/sparklab_yam/config/cameras.yaml

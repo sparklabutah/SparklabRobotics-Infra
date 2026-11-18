@@ -1,8 +1,8 @@
 """Push each camera's RealSense advanced-mode JSON preset onto the hardware.
 
-Reads ``advanced_json`` from a rig's cameras.yaml, resolved beside it. Run once
-per power-up, before the camera node — the settings persist in the device's own
-memory until it loses power::
+Reads ``advanced_json`` from a rig's cameras.yaml, resolved beside it. The camera
+node loads each preset as it starts; this loads them while the node is stopped. The
+settings persist in the device's own memory until it loses power::
 
     ros2 run sparklab_cameras apply_presets src/sparklab_yam/config/cameras.yaml
 """
