@@ -2,6 +2,7 @@
 
     ros2 launch sparklab_gello teleop.launch.py
     ros2 launch sparklab_gello teleop.launch.py sim:=true viewer:=true
+    ros2 launch sparklab_gello teleop.launch.py cameras:=true    # to record
 
 Each leader homes to its arm on start-up. `/gello/arm` then arms both arms, or neither,
 and `/gello/disarm` stops both; one arm alone is `/gello/left/arm` or `/gello/right/arm`.
@@ -10,9 +11,11 @@ Ctrl-C stops everything; the drivers park the arms to zero, and the leaders fold
 
 from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
@@ -23,8 +26,18 @@ LEADERS = {
 }
 
 
+def _static_tf(t: dict, condition: IfCondition) -> Node:
+    x, y, z = map(str, t["translation"])
+    qx, qy, qz, qw = map(str, t["rotation"])
+    return Node(package="tf2_ros", executable="static_transform_publisher", name=f"tf_{t['child']}",
+                arguments=["--x", x, "--y", y, "--z", z, "--qx", qx, "--qy", qy, "--qz", qz, "--qw", qw,
+                           "--frame-id", t["parent"], "--child-frame-id", t["child"]],
+                condition=condition)
+
+
 def generate_launch_description() -> LaunchDescription:
-    params = str(Path(get_package_share_directory("sparklab_yam")) / "config" / "yam.yaml")
+    rig = Path(get_package_share_directory("sparklab_yam")) / "config"
+    params = str(rig / "yam.yaml")
     config = Path(get_package_share_directory("sparklab_gello")) / "config"
     sim, viewer = LaunchConfiguration("sim"), LaunchConfiguration("viewer")
     # Sim drivers stall past 0.1 s when the shared PC is loaded; hardware keeps the default.
@@ -48,10 +61,18 @@ def generate_launch_description() -> LaunchDescription:
             "mapping_path": str(config / mapping),
             "state_timeout_s": state_timeout,
         }]))
+    # The camera node and camera TF as yam.launch.py starts them.
+    cameras = IfCondition(LaunchConfiguration("cameras"))
+    nodes.append(Node(package="sparklab_cameras", executable="cameras", name="cameras",
+                      parameters=[{"rig": str(rig / "cameras.yaml")}], condition=cameras))
+    transforms = yaml.safe_load((rig / "extrinsics.yaml").read_text())["transforms"]
+    nodes += [_static_tf(t, cameras) for t in transforms]
     return LaunchDescription([
         DeclareLaunchArgument("sim", default_value="false",
                               description="i2rt SimRobots instead of CAN hardware"),
         DeclareLaunchArgument("viewer", default_value="false",
                               description="MuJoCo window per simulated arm (sim only)"),
+        DeclareLaunchArgument("cameras", default_value="false",
+                              description="the cameras and their TF, to record"),
         *nodes,
     ])
