@@ -30,6 +30,7 @@ Both arms. This starts the drivers too, so don't run `yam.launch.py` alongside i
 ```bash
 ros2 launch sparklab_gello teleop.launch.py                          # real arms
 ros2 launch sparklab_gello teleop.launch.py sim:=true viewer:=true   # simulated arms
+ros2 launch sparklab_gello teleop.launch.py cameras:=true            # also the cameras, to record
 ros2 service call /gello/arm std_srvs/srv/Trigger                    # both arms follow
 ros2 service call /gello/disarm std_srvs/srv/Trigger                 # both stop
 ```
@@ -56,6 +57,9 @@ ros2 service call /gello/arm std_srvs/srv/Trigger
    arms. Keep hands off.
 
 If the node is killed, the arm holds its last target.
+
+To record a LeRobot dataset while you drive, see
+[`lerobot_robot_sparklab`](../lerobot_robot_sparklab/README.md#recording-record_manual).
 
 ## Parameters
 

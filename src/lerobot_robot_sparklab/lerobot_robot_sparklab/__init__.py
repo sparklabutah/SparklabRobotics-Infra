@@ -3,6 +3,7 @@
     --robot.type=yam_ultra_bimanual   the real arms, via the sparklab_yam drivers
     --robot.type=yam_ultra_sim        the Isaac twin, over HTTP
     --teleop.type=bi_quest_teleop     Quest teleop, via the sparklab_quest bridge
+    --teleop.type=bi_gello            what the sparklab_gello nodes command, for recording
 
 The ``lerobot_robot_`` distribution prefix and these re-exports are both
 load-bearing for plugin discovery — see DESIGN.md before changing either.
@@ -10,7 +11,9 @@ load-bearing for plugin discovery — see DESIGN.md before changing either.
 
 from .follower import YamUltraFollower, YamUltraFollowerConfig
 from .sim_follower import YamUltraSim, YamUltraSimConfig
-from .teleoperator import BiQuestTeleoperator, BiQuestTeleoperatorConfig
+from .teleoperator import (BiGelloTeleoperator, BiGelloTeleoperatorConfig, BiQuestTeleoperator,
+                           BiQuestTeleoperatorConfig)
 
-__all__ = ["BiQuestTeleoperator", "BiQuestTeleoperatorConfig", "YamUltraFollower",
-           "YamUltraFollowerConfig", "YamUltraSim", "YamUltraSimConfig"]
+__all__ = ["BiGelloTeleoperator", "BiGelloTeleoperatorConfig", "BiQuestTeleoperator",
+           "BiQuestTeleoperatorConfig", "YamUltraFollower", "YamUltraFollowerConfig", "YamUltraSim",
+           "YamUltraSimConfig"]

@@ -39,7 +39,9 @@ from .guard import ARMED, DISARMED, ArmGuard, GuardLimits
 from .reader import GelloInputError, GelloReader
 
 ARM_TIMEOUT_S = 1.0
-SETTLE_S, SETTLE_RAD, SETTLE_TIMEOUT_S = 1.0, 0.003, 30.0
+# The left wrist buzzes ~7 mrad peak-to-peak at rest; the startup ramp moves ~28 mrad in its first second
+# (both measured on the rig, 2026-11-10).
+SETTLE_S, SETTLE_RAD, SETTLE_TIMEOUT_S = 1.0, 0.015, 30.0
 
 
 def settled_state(node: Node, topic: str) -> JointState:

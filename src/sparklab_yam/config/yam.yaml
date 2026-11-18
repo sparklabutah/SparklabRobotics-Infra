@@ -3,7 +3,7 @@
   ros__parameters:
     rate_hz: 100.0
     max_step: [0.133, 0.133, 0.133, 0.15, 0.15, 0.15]  # rad per command
-    park_duration_s: 10.0
+    park_duration_s: 5.0
     park_on_exit: true
     rest_on_start: true  # ramp to the rest pose (DEFAULT_Q_REST) over park_duration_s
     enable_auto_recovery: false

@@ -152,6 +152,19 @@ converted to millimetres (ROS's convention for 16-bit depth) because the
 cameras disagree on units: 1 mm on the D435F, 0.1 mm on the D405s. All three
 sustain colour + depth at full rate, the D405s even on USB 2.1.
 
+**Wrist exposure: 8 ms at gain 64.** A D405's frame rate drops to fit its
+exposure. Streaming both wrists together on 2026-11-12, `hand_default.json`'s
+original 89.8 ms gave 6 fps and blew out the white board; 33 ms gave 15 fps,
+and anything up to 16 ms held 30 fps with no skipped frames. Brightness follows
+exposure × gain: 8 ms at gain 64 (63/77 of 255) keeps the board's holes, while
+gain 96 starts to clip them and 128 loses them. A short exposure is the point:
+under auto-exposure the wrists recorded at about 30 ms, which smeared every
+frame of a fast arm move, and the darker right wrist dropped to 15 fps.
+A preset lives in the camera's memory only until it loses power: after the
+rig rebooted, all three cameras were silently back on auto-exposure because
+nobody had rerun `apply_presets`. So the camera node now loads every preset as
+it starts, before opening the camera.
+
 **Image speed.** Assigning `bytes` to `Image.data` takes ~90 ms for a 720p
 frame (rclpy copies it element by element) and capped the top camera near
 4 Hz. Assigning an `array.array('B')` takes 0.1 ms; with it all three cameras
@@ -742,6 +755,84 @@ raise rather than return an approximation.
 **`command` is `YamEnv`'s single-target move**: a straight-line joint ramp at
 0.4 rad/s under the 0.15 rad lag guard, the values capx_sparklab runs on the rig.
 The gripper moves after the arm arrives, the order a grasp needs.
+
+## Gaze recording for Gaze4Collab
+
+**The gaze is recorded beside a clean top camera, and drawn after.**
+`record_manual --gaze=true` stores each frame's gaze columns; when the session ends,
+Gaze4Collab's `derive.py` draws the trail into `<repo_id>_gaze` and leaves
+`<repo_id>_hand` without it, so both conditions train on the same demonstrations.
+Drawing live instead (a version that did) gives up that baseline and buys nothing:
+`derive.py` draws frame k from the columns of frames k-23..k, all recorded by frame k,
+so its trail is the one a live drawing, or a rollout, would show. The cost is that
+`_gaze`'s top video is encoded twice. The version before that filled each frame from
+the sample nearest its stamp, including samples that arrived after it, which a rollout
+never has. `derive.py` runs in Gaze4Collab's own env: importing it imports its
+simulator.
+
+**A frame takes the newest sample, if it arrived within 0.1 s.** Freshness is judged
+by arrival, not by the sample's stamp, because the glasses' stream and the mapping
+lag by an amount not yet measured; 0.1 s is aria_ros2_bridge's `render_episode`
+`gaze.max_gap`, a guess to tune on the glasses.
+
+**H.264, and no Aria viewer.** In the first rig session (2026-11-12) GELLO teleop turned
+choppy while recording: the 24-core rig ran at a load of 25, with the Aria node and its
+Rerun viewer at 128% CPU. On that session's top-camera frames, LeRobot's default SVT-AV1
+(preset 12, run by this build as 10) cost 1.14 CPU-s per second of video, and x264
+veryfast at crf 23 cost 0.27 at about the same size (0.54 against 0.59 MB/s). Those are
+the settings Gaze4Collab writes its own videos with.
+
+**The recording script lives in Gaze4Collab** (`real/record.sh`, once `scripts/record_gaze.sh`
+here). The pin layouts, the collection window and `derive.py` are the study's; this repo keeps
+what any study could use: `record_manual`, the gaze columns, and the two topics below.
+
+**The collection window is its own process.** It talks to `record_manual` only through
+`/record_manual/state` and `/record_manual/command`, so a Tk and matplotlib redraw never shares
+an interpreter with the 120 Hz teleop loop, and the recorder knows nothing of pins.
+
+**The phone page is served by the collection window.** The person across the table starts and
+ends episodes from a phone, and the teleoperator has both hands on the leaders. The page shows
+the recorder's state and the layout, through the same topics, so the recorder is unchanged. A phone
+on the glasses' Wi-Fi reaches the rig at its public address, so every path sits
+under a key, and the page cannot quit the recorder. A Start tap without gaze is greyed out,
+and taps within 1 s of each other are dropped: a double tap would start an episode and end it.
+
+**The window shows only a QR code of the page.** The operator at the workstation must not see
+the layout, or they could time the handover from it, so the layout and the buttons live on the
+phone alone. The window had keys too, and they counted twice: under X11 the recorder's key
+listener is global, so space typed into the window reached the recorder once through the window
+and once directly. The page is on port 8770 because foxglove_bridge takes 8765, its default, and
+the window then failed to start.
+
+**Job control in record.sh.** A non-interactive shell starts its background jobs with
+SIGINT ignored, and an ignored SIGINT stays ignored: ros2 launch installs no handler for it,
+and the aria node, which leaves SIGINT to Python, never sees it. In the first rig session
+the glasses' node never stopped and the script waited on it for 37 minutes, the derive step
+with it. `set -m` gives each job SIGINT and a process group of its own, and ros2 launch then
+escalates a node that hangs on close to SIGTERM and SIGKILL, as the SDK can.
+
+**No episode starts without gaze.** In `test3` (2026-11-12) the glasses' stream died 47 s
+into the session, silently, and a 3¾-minute episode was recorded with no gaze at all; the
+`NO GAZE` on the status line went unnoticed. A start press is now refused unless a gaze point
+came in within `LIVE_S`. Gaze lost mid-episode is not handled.
+
+**Only the top camera's pixel is filled.** `derive.py` draws on the top camera alone,
+and the gaze mapping node places points only on what the top camera sees; the wrist
+and face pixels stay -1.
+
+## Recording GELLO teleop
+
+**The recorder only watches.** The GELLO nodes keep publishing straight to the drivers,
+and `--teleop.type=bi_gello` reads those commands back as the action. Relaying them
+through the recorder's 120 Hz loop would resample the nodes' 100 Hz stream, and the
+driver's feed-forward low-passes the velocity of successive commands: the lags in
+[Wrist gains and velocity feed-forward](#wrist-gains-and-velocity-feed-forward-in-teleoplaunchpy)
+were measured on the direct stream. A GELLO node also refuses to arm while a second
+node publishes its command topics, so `--robot.command_arms=false` creates none.
+
+**No parking between episodes.** The driver ignores commands while it parks, but an
+armed GELLO node keeps tracking its leader, so once the park ended the arm would chase
+the leader back as fast as the driver's `max_step` allows.
 
 ## Two rules plugin discovery depends on
 

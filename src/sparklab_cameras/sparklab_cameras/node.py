@@ -11,10 +11,11 @@ Per camera id, all stamped together and with frame_id = id:
     /cameras/<id>/points                    sensor_msgs/PointCloud2  xyz (m) + rgb in the optical frame,
                                             every 4th pixel, <= 10 Hz, only while subscribed
 
-Rig file: ``cameras: {<id>: {serial, width, height, fps, crop_height, exposure,
-white_balance, gain}}``; all but serial optional. ``height`` must be a profile
-the sensor offers; ``crop_height`` then centre-crops rows. exposure,
-white_balance and gain freeze those options. A camera that fails to open is
+Rig file: ``cameras: {<id>: {serial, width, height, fps, crop_height, advanced_json,
+exposure, white_balance, gain}}``; all but serial optional. ``height`` must be a profile
+the sensor offers; ``crop_height`` then centre-crops rows. ``advanced_json``, a
+RealSense preset beside the rig file, is loaded onto the camera before it opens.
+exposure, white_balance and gain freeze those options. A camera that fails to open is
 logged and skipped.
 """
 
@@ -34,6 +35,8 @@ import yaml
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+
+from .apply_presets import apply as apply_preset
 
 STREAMS = ("color", "depth")
 # Every 4th pixel at <= 10 Hz keeps a 720p cloud near 1 MB and the stream light enough for Foxglove.
@@ -107,6 +110,9 @@ class CameraNode(Node):
         self._pipes: list = []
         for cam_id, cfg in (yaml.safe_load(rig.read_text())["cameras"] or {}).items():
             try:
+                if cfg.get("advanced_json"):
+                    # A preset lasts only until the camera loses power, so load it every start.
+                    apply_preset(str(cfg["serial"]), rig.parent / cfg["advanced_json"])
                 pipe, profile = self._open(cfg)
             except RuntimeError as e:
                 self.get_logger().error(f"camera {cam_id} ({cfg['serial']}) not opened: {e}")
