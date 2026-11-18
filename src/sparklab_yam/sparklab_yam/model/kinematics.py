@@ -43,7 +43,10 @@ JOINT6_AXIS = "0 0 -1"
 TOOL0_OFFSET_XYZ = np.array([0.0, 0.0, -0.1347])
 TOOL0_OFFSET_QUAT = np.array([0.0, 1.0, 0.0, 0.0])
 
-DEFAULT_Q_REST = np.array([0.0, 0.5, 1.0, -1.0, 0.0, 0.0])
+DEFAULT_Q_REST = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+### below is the resting pose of the ABC VLA
+# DEFAULT_Q_REST = np.array([0.0, 0.5, 1.0, -1.0, 0.0, 0.0])
 
 # joint name -> ((lower, upper), why). _check_against_i2rt() reports these as
 # expected rather than drift, so the check stays meaningful.
