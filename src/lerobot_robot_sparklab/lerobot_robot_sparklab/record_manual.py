@@ -15,8 +15,16 @@ every ``control_hz / fps``-th tick. Needs the rig up
         --robot.type=yam_ultra_bimanual --teleop.type=bi_quest_teleop \\
         --dataset.repo_id=minhphd/task --dataset.single_task="..." \\
         --dataset.num_episodes=50
+
+With the GELLO leaders instead (``ros2 launch sparklab_gello teleop.launch.py cameras:=true``),
+pass ``--teleop.type=bi_gello --robot.command_arms=false --log_xr=false``; the arms never park.
+
+A window can follow and drive the session: ``/record_manual/state`` (std_msgs/String, JSON
+at 10 Hz: state, episode, seconds, frames, saved, discarded, gaze) and
+``/record_manual/command`` (std_msgs/String: space, r or q, as if typed).
 """
 
+import json
 import logging
 import shutil
 import sys
@@ -42,8 +50,12 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.keyboard_input import create_key_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
+from rclpy.node import Node
+from std_msgs.msg import String
 
 from sparklab_quest.buttons import B_Y
+
+from . import gaze, ros
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +74,9 @@ class ManualRecordConfig:
     log_xr: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Record the Aria wearer's gaze as Gaze4Collab's columns; the top camera stays clean.
+    # An episode then starts only while gaze is coming in.
+    gaze: bool = False
 
     def __post_init__(self):
         ratio = self.control_hz / self.dataset.fps
@@ -70,6 +85,9 @@ class ManualRecordConfig:
                 f"control_hz ({self.control_hz}) must be an integer multiple "
                 f"of dataset.fps ({self.dataset.fps})"
             )
+        if self.teleop.type == "bi_gello" and getattr(self.robot, "command_arms", True):
+            raise ValueError("--teleop.type=bi_gello records what the GELLO nodes command; "
+                             "pass --robot.command_arms=false so nothing else commands the arms")
 
 
 @dataclass
@@ -186,10 +204,11 @@ def _park_and_reseed(robot, teleop) -> None:
         teleop.seed_qpos_from_obs(robot.get_observation())
 
 
-def _status_line(state: str, frames: int, seconds: float) -> str:
+def _status_line(state: str, frames: int, seconds: float, gaze_live: bool | None = None) -> str:
+    suffix = "" if gaze_live is None else ("   gaze ✓" if gaze_live else "   NO GAZE")
     if state == "recording":
-        return f"● REC  {seconds:6.1f}s  {frames} frames   (space = end episode)"
-    return "○ RESET — reposition, then space = start next episode"
+        return f"● REC  {seconds:6.1f}s  {frames} frames   (space = end episode){suffix}"
+    return f"○ RESET — reposition, then space = start next episode{suffix}"
 
 
 @parser.wrap()
@@ -216,6 +235,8 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
     )
     if cfg.log_xr:
         dataset_features = {**dataset_features, **_xr_features()}
+    if cfg.gaze:
+        dataset_features = {**dataset_features, **gaze.FEATURES}
 
     num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
     if cfg.resume:
@@ -254,10 +275,14 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
     log_xr = cfg.log_xr and "observation.xr.left_pose" in dataset.features
     if cfg.log_xr and not log_xr:
         logging.warning("resumed dataset has no XR features — XR logging disabled")
-    # xr.* is filled from the teleop, not the robot obs; build_dataset_frame
-    # must not try to source its names ("px", ...) from obs_processed.
+    if cfg.gaze and "observation.gaze" not in dataset.features:
+        raise ValueError(f"{dataset.root} has no gaze columns to resume with --gaze=true")
+    tracker = gaze.GazeTracker(cfg.dataset.fps) if cfg.gaze else None
+    # xr.* and gaze* are filled from the teleop and the tracker, not the robot obs;
+    # build_dataset_frame must not try to source their names ("px", ...) from obs_processed.
     frame_features = {
-        k: v for k, v in dataset.features.items() if not k.startswith("observation.xr.")
+        k: v for k, v in dataset.features.items()
+        if not k.startswith(("observation.xr.", "observation.gaze"))
     }
 
     # Key presses land on the listener thread; the loop consumes the flags at
@@ -279,10 +304,14 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
     status_every = max(1, round(cfg.control_hz / 10))
     state = "reset"
     listener = None
+    close_node = None
+    parking = " — parking" if getattr(cfg.robot, "command_arms", True) else ""
 
     try:
         robot.connect()
         teleop.connect()
+        if tracker is not None:
+            tracker.connect()
         # Required before teleop drives the robot (DESIGN.md#teleoperation);
         # without it the first action snaps the arms to the teleop's rest pose.
         if hasattr(teleop, "seed_qpos_from_obs"):
@@ -290,6 +319,11 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
         listener = create_key_listener(on_key, controls_help=HELP_LINE)
         if listener is None:
             raise RuntimeError("No keyboard backend available — manual recording needs one.")
+        ros.init()
+        node = Node("record_manual")
+        state_pub = node.create_publisher(String, "/record_manual/state", 10)
+        node.create_subscription(String, "/record_manual/command", lambda m: on_key(m.data), 10)
+        close_node = ros.spin_in_background(node)
 
         sess = _Session(started_t=time.perf_counter())
         ep_frames = 0
@@ -310,6 +344,8 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
                 record_tick = state == "recording" and tick % record_every == 0
                 if record_tick:
                     obs = robot.get_observation()
+                    if tracker is not None:
+                        gaze_frame = tracker.step()
                     obs_processed = robot_observation_processor(obs)
 
                 act = teleop.get_action()
@@ -334,6 +370,8 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
                     }
                     if log_xr:
                         frame.update(_xr_frame_values(teleop))
+                    if tracker is not None:
+                        frame.update(gaze_frame)
                     dataset.add_frame(frame)
                     ep_frames += 1
 
@@ -343,26 +381,31 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
                         dataset.clear_episode_buffer()
                         sess.discarded += 1
                         state = "reset"
-                        print(f"\n✗ discarded episode after {ep_frames} frames — parking\n")
+                        print(f"\n✗ discarded episode after {ep_frames} frames{parking}\n")
                         _park_and_reseed(robot, teleop)
 
                 if events["toggle"]:
                     events["toggle"] = False
-                    if state == "reset":
+                    if state == "reset" and tracker is not None and not tracker.live():
+                        print("\n✗ no gaze: an episode starts only once the gaze reaches the rig\n")
+                    elif state == "reset":
                         state = "recording"
                         ep_frames = 0
                         tick = -1  # first recording tick lands on a record tick
                         ep_start_t = time.perf_counter()
+                        if tracker is not None:
+                            tracker.start()
                         _print_stats(dataset, sess, fps)
                     else:
                         state = "reset"
                         sess.last_ep_s = time.perf_counter() - ep_start_t
                         sess.total_recorded_s += sess.last_ep_s
+                        on = "" if tracker is None else f", gaze on {tracker.share_on():.0%} of frames"
                         dataset.save_episode()
                         sess.saved += 1
                         print(
                             f"\n✔ saved episode {dataset.num_episodes - 1}: "
-                            f"{ep_frames} frames, {sess.last_ep_s:.1f}s — parking\n"
+                            f"{ep_frames} frames, {sess.last_ep_s:.1f}s{on}{parking}\n"
                         )
                         _park_and_reseed(robot, teleop)
 
@@ -379,8 +422,13 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
                 tick += 1
                 if tick % status_every == 0:
                     seconds = time.perf_counter() - ep_start_t if state == "recording" else 0.0
-                    sys.stdout.write("\r\033[K" + _status_line(state, ep_frames, seconds))
+                    live = None if tracker is None else tracker.live()
+                    sys.stdout.write("\r\033[K" + _status_line(state, ep_frames, seconds, live))
                     sys.stdout.flush()
+                    state_pub.publish(String(data=json.dumps({
+                        "state": state, "episode": dataset.num_episodes, "seconds": round(seconds, 1),
+                        "frames": ep_frames, "saved": sess.saved, "discarded": sess.discarded,
+                        "gaze": live})))
 
             if state == "recording":
                 dataset.clear_episode_buffer()
@@ -395,8 +443,12 @@ def record_manual(cfg: ManualRecordConfig) -> LeRobotDataset:
             robot.disconnect()
         if teleop.is_connected:
             teleop.disconnect()
+        if tracker is not None:
+            tracker.close()
         if listener is not None:
             listener.stop()
+        if close_node is not None:
+            close_node()
         # A zero-episode dataset is an unloadable shell (no tasks.parquet) that
         # 404s in every tool later; delete it rather than leave the corpse.
         if not cfg.resume and dataset.num_episodes == 0:

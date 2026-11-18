@@ -61,6 +61,9 @@ class YamUltraFollowerConfig(RobotConfig):
     # Not `cameras`: RobotConfig reserves that for LeRobot CameraConfigs.
     camera_ids: list[str] = field(default_factory=lambda: list(_rig_cameras()))
     connect_timeout_s: float = 10.0
+    # False while the GELLO nodes drive the arms: no command publishers, as their arm check
+    # requires, no parking, and send_action only reports the clamped action.
+    command_arms: bool = True
 
 
 class YamUltraFollower(Robot):
@@ -130,9 +133,10 @@ class YamUltraFollower(Robot):
         for h in HANDS:
             node.create_subscription(JointState, f"/{h}/joint_states",
                                      lambda m, h=h: self._state.__setitem__(h, m), 10)
-            self._arm_pubs[h] = node.create_publisher(Float64MultiArray, f"/{h}/arm/command", 10)
-            self._gripper_pubs[h] = node.create_publisher(Float64, f"/{h}/gripper/command", 10)
-            self._park[h] = node.create_client(Trigger, f"/{h}/park")
+            if self.config.command_arms:
+                self._arm_pubs[h] = node.create_publisher(Float64MultiArray, f"/{h}/arm/command", 10)
+                self._gripper_pubs[h] = node.create_publisher(Float64, f"/{h}/gripper/command", 10)
+                self._park[h] = node.create_client(Trigger, f"/{h}/park")
         for c in self.cameras:
             node.create_subscription(Image, f"/cameras/{c}/color/image_raw",
                                      lambda m, c=c: self._images.__setitem__(c, m), 1)
@@ -200,7 +204,7 @@ class YamUltraFollower(Robot):
         arm was actually told to take.
 
         action: `.pos` keys; omitted joints hold their last commanded value.
-        Returns: the Δq-clamped action sent, in the same keys.
+        Returns: the Δq-clamped action, in the same keys; sent only with command_arms.
         """
         self._require_fresh("send_action")
         sent: dict[str, float] = {}
@@ -215,12 +219,13 @@ class YamUltraFollower(Robot):
                 target = present + np.clip(step, -self._caps, self._caps)
                 self._warn_clamp(h, np.abs(step) - self._caps)
             self._last_sent[h] = target
-            self._arm_pubs[h].publish(Float64MultiArray(data=target.tolist()))
+            if self.config.command_arms:
+                self._arm_pubs[h].publish(Float64MultiArray(data=target.tolist()))
             sent.update(zip(self._ARM_KEYS[h], target.tolist()))
 
             gkey = self._GRIPPER_KEYS[h]
             sent[gkey] = float(action.get(gkey, self._state[h].position[ARM_JOINTS]))
-            if gkey in action:
+            if gkey in action and self.config.command_arms:
                 self._gripper_pubs[h].publish(Float64(data=sent[gkey]))
         return sent
 
@@ -237,7 +242,10 @@ class YamUltraFollower(Robot):
         """Ramp both arms to the zero pose and hold, where torque is safe to cut.
 
         Blocks for the drivers' park_duration_s; both start before either is awaited.
+        Does nothing without command_arms.
         """
+        if not self.config.command_arms:
+            return
         logger.info("parking both arms to zero")
         futures = {h: self._park[h].call_async(Trigger.Request()) for h in HANDS}
         deadline = time.monotonic() + 30.0

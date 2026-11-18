@@ -28,6 +28,8 @@ flowchart LR
     cams["cameras<br/>3 RealSense"] -- "/cameras/*/color<br/>/cameras/*/depth" --> drive
     cams -->|"/cameras/*/color"| bridge
     harness[harness page] <-->|"/rollout/*"| lerobot
+    gm["aria + gaze_mapping<br/>(aria_ros2_bridge)"] -->|"/gaze_mapping/gaze"| lerobot
+    gello -.->|"arm/command, recorded"| lerobot
     drivers -.->|"/tf"| fox[Foxglove]
     cams -.->|"images, clouds"| fox
 ```
@@ -67,7 +69,7 @@ mamba create -n sparklab-ros -c conda-forge -c robostack-humble \
 conda activate sparklab-ros
 conda env config vars set LD_LIBRARY_PATH="$CONDA_PREFIX/lib" && conda activate sparklab-ros
 
-pip install "lerobot==0.6.0" mujoco pyrealsense2 fastapi "uvicorn[standard]" aiortc av \
+pip install "lerobot[dataset]==0.6.0" mujoco pyrealsense2 fastapi "uvicorn[standard]" aiortc av \
     opencv-python-headless pyyaml "setuptools<80" "pytest<8"
 git clone https://github.com/i2rt-robotics/i2rt && pip install -e ./i2rt
 pip install "lerobot_teleoperator_yamactiveleader @ git+https://github.com/uynitsuj/lerobot_teleoperator_yamactiveleader@4ed519781152562ba338a8ebcd0e4cd781b3029f"   # GELLO only
@@ -103,6 +105,7 @@ On start the arms ramp to the rest pose; on Ctrl-C they fold to the park pose
 | drive both arms from the GELLO leaders (starts the drivers too) | `ros2 launch sparklab_gello teleop.launch.py`, then `ros2 service call /gello/arm std_srvs/srv/Trigger` |
 | move one joint at a time from the keyboard | `ros2 run sparklab_yam keyboard` |
 | record a dataset | `./scripts/record_manual.sh` |
+| record a dataset with an Aria wearer's gaze (Gaze4Collab), with GELLO or the Quest | `../Gaze4Collab/real/record.sh`, see Gaze4Collab's README, "Recording on the real rig" |
 | run a policy | `./scripts/rollout.sh` |
 | run ABC's policy | see [`abc_bridge`](src/abc_bridge/README.md) |
 | let an LLM drive the arms through tools (cap-x) | see [`capx_sparklab`](src/capx_sparklab/README.md#running-a-session) |
